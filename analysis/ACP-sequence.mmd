@@ -1,0 +1,28 @@
+```mermaid
+graph TB
+    subgraph External["外部应用"]
+        IDE[IDE/编辑器]
+        CodingAgent[编码 Agent<br/>Codex/Claude]
+        CustomApp[自定义应用]
+    end
+    
+    subgraph ACP["ACP 层"]
+        ACPBridge[ACP Bridge<br/>openclaw acp]
+        ACPProtocol[ACP 协议<br/>stdio/WebSocket]
+    end
+    
+    subgraph Gateway["OpenClaw Gateway"]
+        WebSocket[WebSocket 服务器<br/>:18789]
+        SessionRouter[会话路由]
+        AgentRuntime[Agent 运行时]
+    end
+    
+    IDE -->|stdio| ACPBridge
+    CodingAgent -->|stdio| ACPBridge
+    CustomApp -->|WebSocket| ACPBridge
+    
+    ACPBridge -->|ACP 协议 | ACPProtocol
+    ACPProtocol -->|WebSocket| WebSocket
+    WebSocket --> SessionRouter
+    SessionRouter --> AgentRuntime
+```
