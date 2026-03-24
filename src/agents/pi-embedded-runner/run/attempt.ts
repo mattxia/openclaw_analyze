@@ -2467,6 +2467,8 @@ export async function runEmbeddedAttempt(
         };
       }
 
+      // 包装流函数，支持会话让步场景的中止处理
+      // 当检测到让步请求且中止原因为"sessions_yield"时，返回模拟的中止响应
       const innerStreamFn = activeSession.agent.streamFn;
       activeSession.agent.streamFn = (model, context, options) => {
         const signal = runAbortController.signal as AbortSignal & { reason?: unknown };
@@ -2478,14 +2480,14 @@ export async function runEmbeddedAttempt(
         return innerStreamFn(model, context, options);
       };
 
-      // Some models emit tool names with surrounding whitespace (e.g. " read ").
-      // pi-agent-core dispatches tool calls with exact string matching, so normalize
-      // names on the live response stream before tool execution.
+      // 修剪工具调用名称中的空白字符
+      // 某些模型返回的工具名称带有前后空格（如" read "），需要在工具执行前标准化
       activeSession.agent.streamFn = wrapStreamFnTrimToolCallNames(
         activeSession.agent.streamFn,
         allowedToolNames,
       );
 
+      // 为 Anthropic 格式的模型（如 Kimi Coding）修复格式错误的工具调用参数
       if (
         params.model.api === "anthropic-messages" &&
         shouldRepairMalformedAnthropicToolCallArguments(params.provider)
@@ -2495,12 +2497,14 @@ export async function runEmbeddedAttempt(
         );
       }
 
+      // 为 xAI/Grok 模型解码工具调用参数中的 HTML 实体
       if (isXaiProvider(params.provider, params.modelId)) {
         activeSession.agent.streamFn = wrapStreamFnDecodeXaiToolCallArguments(
           activeSession.agent.streamFn,
         );
       }
 
+      // 应用 Anthropic 负载日志记录器（如果启用）
       if (anthropicPayloadLogger) {
         activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
           activeSession.agent.streamFn,
@@ -2508,6 +2512,7 @@ export async function runEmbeddedAttempt(
       }
 
       try {
+        // 清理会话历史，确保消息格式符合当前模型的要求
         const prior = await sanitizeSessionHistory({
           messages: activeSession.messages,
           modelApi: params.model.api,
@@ -2520,19 +2525,20 @@ export async function runEmbeddedAttempt(
           policy: transcriptPolicy,
         });
         cacheTrace?.recordStage("session:sanitized", { messages: prior });
+        // 验证 Gemini 格式的消息轮次
         const validatedGemini = transcriptPolicy.validateGeminiTurns
           ? validateGeminiTurns(prior)
           : prior;
+        // 验证 Anthropic 格式的消息轮次
         const validated = transcriptPolicy.validateAnthropicTurns
           ? validateAnthropicTurns(validatedGemini)
           : validatedGemini;
+        // 限制历史消息轮数，避免超出上下文窗口
         const truncated = limitHistoryTurns(
           validated,
           getDmHistoryLimitFromSessionKey(params.sessionKey, params.config),
         );
-        // Re-run tool_use/tool_result pairing repair after truncation, since
-        // limitHistoryTurns can orphan tool_result blocks by removing the
-        // assistant message that contained the matching tool_use.
+        // 截断后重新修复 tool_use/tool_result 配对，因为截断可能导致 tool_result 孤立
         const limited = transcriptPolicy.repairToolUseResultPairing
           ? sanitizeToolUseResultPairing(truncated)
           : truncated;
@@ -2541,6 +2547,7 @@ export async function runEmbeddedAttempt(
           activeSession.agent.replaceMessages(limited);
         }
 
+        // 应用上下文引擎的 assemble 阶段（如果启用）
         if (params.contextEngine) {
           try {
             const assembled = await params.contextEngine.assemble({
@@ -2569,6 +2576,7 @@ export async function runEmbeddedAttempt(
           }
         }
       } catch (err) {
+        // 错误处理：刷新待处理的工具结果，清理会话，重新抛出错误
         await flushPendingToolResultsAfterIdle({
           agent: activeSession?.agent,
           sessionManager,
@@ -2578,23 +2586,28 @@ export async function runEmbeddedAttempt(
         throw err;
       }
 
+      // 运行状态标志
       let aborted = Boolean(params.abortSignal?.aborted);
       let yieldAborted = false;
       let timedOut = false;
       let timedOutDuringCompaction = false;
+      // 获取中止原因的辅助函数
       const getAbortReason = (signal: AbortSignal): unknown =>
         "reason" in signal ? (signal as { reason?: unknown }).reason : undefined;
+      // 创建超时中止原因的辅助函数
       const makeTimeoutAbortReason = (): Error => {
         const err = new Error("request timed out");
         err.name = "TimeoutError";
         return err;
       };
+      // 创建中止错误对象的辅助函数
       const makeAbortError = (signal: AbortSignal): Error => {
         const reason = getAbortReason(signal);
         const err = reason ? new Error("aborted", { cause: reason }) : new Error("aborted");
         err.name = "AbortError";
         return err;
       };
+      // 中止正在进行的会话压缩
       const abortCompaction = () => {
         if (!activeSession.isCompacting) {
           return;
@@ -2609,6 +2622,7 @@ export async function runEmbeddedAttempt(
           }
         }
       };
+      // 中止运行，包括停止流式响应和会话压缩
       const abortRun = (isTimeout = false, reason?: unknown) => {
         aborted = true;
         if (isTimeout) {
@@ -2622,6 +2636,7 @@ export async function runEmbeddedAttempt(
         abortCompaction();
         void activeSession.abort();
       };
+      // 包装 Promise，使其可被中止信号中断
       const abortable = <T>(promise: Promise<T>): Promise<T> => {
         const signal = runAbortController.signal;
         if (signal.aborted) {
@@ -2646,6 +2661,7 @@ export async function runEmbeddedAttempt(
         });
       };
 
+      // 订阅会话事件，收集运行结果（助手回复、工具调用、使用量统计等）
       const subscription = subscribeEmbeddedPiSession({
         session: activeSession,
         runId: params.runId,
@@ -2672,6 +2688,7 @@ export async function runEmbeddedAttempt(
         agentId: sessionAgentId,
       });
 
+      // 解构订阅返回的结果收集器和状态查询函数
       const {
         assistantTexts,
         toolMetas,
@@ -2688,6 +2705,7 @@ export async function runEmbeddedAttempt(
         getCompactionCount,
       } = subscription;
 
+      // 创建队列句柄，用于外部查询和控制当前运行状态
       const queueHandle: EmbeddedPiQueueHandle = {
         queueMessage: async (text: string) => {
           await activeSession.steer(text);
@@ -2696,13 +2714,16 @@ export async function runEmbeddedAttempt(
         isCompacting: () => subscription.isCompacting(),
         abort: abortRun,
       };
+      // 注册当前运行为活动状态，允许外部查询和中断
       setActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
 
+      // 超时和中止相关的状态变量
       let abortWarnTimer: NodeJS.Timeout | undefined;
       const isProbeSession = params.sessionId?.startsWith("probe-") ?? false;
       const compactionTimeoutMs = resolveCompactionTimeoutMs(params.config);
       let abortTimer: NodeJS.Timeout | undefined;
       let compactionGraceUsed = false;
+      // 调度中止定时器，支持压缩期间的宽限期延长
       const scheduleAbortTimer = (delayMs: number, reason: "initial" | "compaction-grace") => {
         abortTimer = setTimeout(
           () => {
@@ -2712,6 +2733,7 @@ export async function runEmbeddedAttempt(
               graceAlreadyUsed: compactionGraceUsed,
             });
             if (timeoutAction === "extend") {
+              // 如果正在压缩中，延长截止时间
               compactionGraceUsed = true;
               if (!isProbeSession) {
                 log.warn(
@@ -2723,6 +2745,7 @@ export async function runEmbeddedAttempt(
               return;
             }
 
+            // 记录超时日志
             if (!isProbeSession) {
               log.warn(
                 reason === "compaction-grace"
@@ -2730,6 +2753,7 @@ export async function runEmbeddedAttempt(
                   : `embedded run timeout: runId=${params.runId} sessionId=${params.sessionId} timeoutMs=${params.timeoutMs}`,
               );
             }
+            // 标记是否在压缩期间超时
             if (
               shouldFlagCompactionTimeout({
                 isTimeout: true,
@@ -2739,7 +2763,9 @@ export async function runEmbeddedAttempt(
             ) {
               timedOutDuringCompaction = true;
             }
+            // 执行中止
             abortRun(true);
+            // 设置警告定时器，如果中止后仍在流式传输则记录日志
             if (!abortWarnTimer) {
               abortWarnTimer = setTimeout(() => {
                 if (!activeSession.isStreaming) {
@@ -2756,10 +2782,13 @@ export async function runEmbeddedAttempt(
           Math.max(1, delayMs),
         );
       };
+      // 启动初始超时定时器
       scheduleAbortTimer(params.timeoutMs, "initial");
 
+      // 会话快照和 ID 记录
       let messagesSnapshot: AgentMessage[] = [];
       let sessionIdUsed = activeSession.sessionId;
+      // 外部中止信号的处理函数
       const onAbort = () => {
         const reason = params.abortSignal ? getAbortReason(params.abortSignal) : undefined;
         const timeout = reason ? isTimeoutError(reason) : false;
@@ -2774,6 +2803,7 @@ export async function runEmbeddedAttempt(
         }
         abortRun(timeout, reason);
       };
+      // 注册外部中止信号监听器
       if (params.abortSignal) {
         if (params.abortSignal.aborted) {
           onAbort();
@@ -2784,17 +2814,19 @@ export async function runEmbeddedAttempt(
         }
       }
 
-      // Hook runner was already obtained earlier before tool creation
+      // Hook 运行器已在工具创建前获取
       const hookAgentId = sessionAgentId;
 
+      // Prompt 错误状态记录
       let promptError: unknown = null;
       let promptErrorSource: "prompt" | "compaction" | null = null;
+      // 记录 prompt 前的消息数量，用于后续计算新增消息
       const prePromptMessageCount = activeSession.messages.length;
       try {
         const promptStartedAt = Date.now();
 
-        // Run before_prompt_build hooks to allow plugins to inject prompt context.
-        // Legacy compatibility: before_agent_start is also checked for context fields.
+        // 执行 before_prompt_build hooks，允许插件注入 prompt 上下文
+        // 兼容旧版：before_agent_start 也会被检查用于上下文字段
         let effectivePrompt = params.prompt;
         const hookCtx = {
           agentId: hookAgentId,
@@ -2813,12 +2845,14 @@ export async function runEmbeddedAttempt(
           legacyBeforeAgentStartResult: params.legacyBeforeAgentStartResult,
         });
         {
+          // 应用 Hook 返回的前置上下文
           if (hookResult?.prependContext) {
             effectivePrompt = `${hookResult.prependContext}\n\n${params.prompt}`;
             log.debug(
               `hooks: prepended context to prompt (${hookResult.prependContext.length} chars)`,
             );
           }
+          // 应用 Hook 返回的系统提示覆盖（旧版兼容）
           const legacySystemPrompt =
             typeof hookResult?.systemPrompt === "string" ? hookResult.systemPrompt.trim() : "";
           if (legacySystemPrompt) {
@@ -2826,6 +2860,7 @@ export async function runEmbeddedAttempt(
             systemPromptText = legacySystemPrompt;
             log.debug(`hooks: applied systemPrompt override (${legacySystemPrompt.length} chars)`);
           }
+          // 应用 Hook 返回的前后系统上下文
           const prependedOrAppendedSystemPrompt = composeSystemPromptWithHookContext({
             baseSystemPrompt: systemPromptText,
             prependSystemContext: hookResult?.prependSystemContext,
@@ -3164,11 +3199,12 @@ export async function runEmbeddedAttempt(
               ? "prompt error"
               : undefined,
         });
+        // 记录 Anthropic 负载使用情况（如果启用了日志记录）
         anthropicPayloadLogger?.recordUsage(messagesSnapshot, promptError);
 
-        // Run agent_end hooks to allow plugins to analyze the conversation
-        // This is fire-and-forget, so we don't await
-        // Run even on compaction timeout so plugins can log/cleanup
+        // 执行 agent_end hooks，允许插件分析对话结果
+        // 即发即弃模式，不等待完成
+        // 即使在压缩超时情况下也会执行，以便插件记录日志和清理
         if (hookRunner?.hasHooks("agent_end")) {
           hookRunner
             .runAgentEnd(
@@ -3193,34 +3229,41 @@ export async function runEmbeddedAttempt(
             });
         }
       } finally {
+        // 清理定时器
         clearTimeout(abortTimer);
         if (abortWarnTimer) {
           clearTimeout(abortWarnTimer);
         }
+        // 记录运行清理日志（非探测会话且发生中止/超时时）
         if (!isProbeSession && (aborted || timedOut) && !timedOutDuringCompaction) {
           log.debug(
             `run cleanup: runId=${params.runId} sessionId=${params.sessionId} aborted=${aborted} timedOut=${timedOut}`,
           );
         }
+        // 取消订阅会话事件
         try {
           unsubscribe();
         } catch (err) {
-          // unsubscribe() should never throw; if it does, it indicates a serious bug.
-          // Log at error level to ensure visibility, but don't rethrow in finally block
-          // as it would mask any exception from the try block above.
+          // unsubscribe() 绝不应该抛出异常；如果抛出，说明有严重 bug
+          // 记录错误级别日志以确保可见性，但不在 finally 块中重新抛出
+          // 以免掩盖上面 try 块中的任何异常
           log.error(
             `CRITICAL: unsubscribe failed, possible resource leak: runId=${params.runId} ${String(err)}`,
           );
         }
+        // 清除活动运行注册
         clearActiveEmbeddedRun(params.sessionId, queueHandle, params.sessionKey);
+        // 移除外部中止信号监听器
         params.abortSignal?.removeEventListener?.("abort", onAbort);
       }
 
+      // 查找最后一条助手消息
       const lastAssistant = messagesSnapshot
         .slice()
         .toReversed()
         .find((m) => m.role === "assistant");
 
+      // 标准化工具元数据，过滤空条目
       const toolMetasNormalized = toolMetas
         .filter(
           (entry): entry is { toolName: string; meta?: string } =>
@@ -3228,6 +3271,7 @@ export async function runEmbeddedAttempt(
         )
         .map((entry) => ({ toolName: entry.toolName, meta: entry.meta }));
 
+      // 执行 llm_output hooks，允许插件分析 LLM 输出
       if (hookRunner?.hasHooks("llm_output")) {
         hookRunner
           .runLlmOutput(
@@ -3255,6 +3299,7 @@ export async function runEmbeddedAttempt(
           });
       }
 
+      // 返回运行结果
       return {
         aborted,
         timedOut,
@@ -3279,31 +3324,37 @@ export async function runEmbeddedAttempt(
         ),
         attemptUsage: getUsageTotals(),
         compactionCount: getCompactionCount(),
-        // Client tool call detected (OpenResponses hosted tools)
+        // 检测到客户端工具调用（OpenResponses 托管工具）
         clientToolCall: clientToolCallDetected ?? undefined,
+        // 检测到会话让步
         yieldDetected: yieldDetected || undefined,
       };
     } finally {
-      // Always tear down the session (and release the lock) before we leave this attempt.
+      // 在离开本次尝试前，始终要销毁会话（并释放锁）
       //
-      // BUGFIX: Wait for the agent to be truly idle before flushing pending tool results.
-      // pi-agent-core's auto-retry resolves waitForRetry() on assistant message receipt,
-      // *before* tool execution completes in the retried agent loop. Without this wait,
-      // flushPendingToolResults() fires while tools are still executing, inserting
-      // synthetic "missing tool result" errors and causing silent agent failures.
-      // See: https://github.com/openclaw/openclaw/issues/8643
+      // BUGFIX: 等待 Agent 真正空闲后再刷新待处理的工具结果
+      // pi-agent-core 的自动重试在收到助手消息时就解析 waitForRetry()，
+      // 但这发生在重试后的 Agent 循环中工具执行完成*之前*。如果不等待，
+      // flushPendingToolResults() 会在工具仍在执行时触发，插入
+      // 合成的"missing tool result"错误，导致 Agent 静默失败
+      // 参见：https://github.com/openclaw/openclaw/issues/8643
       removeToolResultContextGuard?.();
       await flushPendingToolResultsAfterIdle({
         agent: session?.agent,
         sessionManager,
         clearPendingOnTimeout: true,
       });
+      // 销毁会话
       session?.dispose();
+      // 释放 WebSocket 会话资源
       releaseWsSession(params.sessionId);
+      // 释放会话文件锁
       await sessionLock.release();
     }
   } finally {
+    // 恢复 Skill 环境变量覆盖
     restoreSkillEnv?.();
+    // 恢复原始工作目录
     process.chdir(prevCwd);
   }
 }
