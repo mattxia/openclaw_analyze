@@ -120,7 +120,7 @@ function applyMessageProviderToolPolicy(
   const deniedTools = TOOL_DENY_BY_MESSAGE_PROVIDER[normalizedProvider];
   // 该渠道没有禁用工具，返回所有工具
   if (!deniedTools || deniedTools.length === 0) {
-    return tools;
+    return tools; 
   }
   // 过滤掉禁用的工具
   const deniedSet = new Set(deniedTools);
