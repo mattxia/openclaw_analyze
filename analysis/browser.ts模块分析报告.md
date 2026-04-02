@@ -1,24 +1,43 @@
+# browser.ts 模块分析报告
+
+## 文件概述
+
+[browser.ts](file:///d:/prj/openclaw_analyze/src/gateway/server-methods/browser.ts) 是OpenClaw Gateway中处理浏览器控制请求的核心模块。它实现了浏览器请求的统一入口，负责将请求路由到本地浏览器控制服务或远程节点浏览器。
+
+---
+
+## 全文注释
+
+```typescript
 // ============================================================
 // 导入依赖
 // ============================================================
 import crypto from "node:crypto"; // 用于生成幂等性密钥
+
 // 浏览器控制服务相关
 import {
-  createBrowserControlContext, // 创建浏览器控制上下文
+  createBrowserControlContext,      // 创建浏览器控制上下文
   startBrowserControlServiceFromConfig, // 从配置启动浏览器控制服务
 } from "../../browser/control-service.js";
+
 // 代理文件处理：远程节点返回的文件需要持久化到本地
 import { applyBrowserProxyPaths, persistBrowserProxyFiles } from "../../browser/proxy-files.js";
+
 // 路由分发器：将请求路由到具体的处理函数
 import { createBrowserRouteDispatcher } from "../../browser/routes/dispatcher.js";
+
 // 配置加载
 import { loadConfig } from "../../config/config.js";
+
 // 节点命令策略：检查命令是否被允许在节点上执行
 import { isNodeCommandAllowed, resolveNodeCommandAllowlist } from "../node-command-policy.js";
+
 import type { NodeSession } from "../node-registry.js"; // 节点会话类型
+
 // 错误处理相关
 import { ErrorCodes, errorShape } from "../protocol/index.js";
 import { respondUnavailableOnNodeInvokeError, safeParseJson } from "./nodes.helpers.js";
+
 import type { GatewayRequestHandlers } from "./types.js"; // Gateway请求处理器类型
 
 // ============================================================
@@ -124,16 +143,16 @@ function resolveRequestedProfile(params: {
  * 代理文件类型：远程节点返回的文件需要以base64形式传输到本地
  */
 type BrowserProxyFile = {
-  path: string; // 文件路径
-  base64: string; // 文件内容的base64编码
-  mimeType?: string; // MIME类型（可选）
+  path: string;      // 文件路径
+  base64: string;     // 文件内容的base64编码
+  mimeType?: string;  // MIME类型（可选）
 };
 
 /**
  * 代理结果类型：远程节点返回的完整响应
  */
 type BrowserProxyResult = {
-  result: unknown; // 操作结果
+  result: unknown;         // 操作结果
   files?: BrowserProxyFile[]; // 附带文件（如果有，如截图）
 };
 
@@ -492,3 +511,94 @@ export const browserHandlers: GatewayRequestHandlers = {
     respond(true, result.body);
   },
 };
+```
+
+---
+
+## 主要功能讲解
+
+### 一、核心架构流程图
+
+```mermaid
+flowchart TD
+    A[browser.request 入口] --> B{参数校验}
+    B -->|失败| E[返回错误]
+    B -->|通过| C{安全检查<br/>持久化profile变更?}
+    C -->|是| E
+    C -->|否| D[解析目标节点]
+
+    D --> F{是否有远程<br/>浏览器节点?}
+
+    F -->|是| G[远程节点分支]
+    F -->|否| H[本地浏览器分支]
+
+    subgraph G [远程节点代理]
+        G1[权限校验] --> G2{允许?}
+        G2 -->|否| E
+        G2 -->|是| G3[构建代理参数]
+        G3 --> G4[nodeRegistry.invoke<br/>调用远程节点]
+        G4 --> G5[处理响应和代理文件]
+        G5 --> G6[返回结果]
+    end
+
+    subgraph H [本地浏览器控制]
+        H1[启动浏览器控制服务] --> H2{启动成功?}
+        H2 -->|失败| E
+        H2 -->|成功| H3[创建路由分发器]
+        H3 --> H4[dispatch分发请求]
+        H4 --> H5[处理响应]
+        H5 --> H6[返回结果]
+    end
+```
+
+### 二、三种路由模式
+
+| 模式 | 配置 | 行为 |
+|------|------|------|
+| **本地模式** | 无可用节点 | 直接调用本地浏览器控制服务 |
+| **远程节点代理** | 有可用节点 | 将请求转发到远程节点执行 |
+| **手动指定** | `gateway.nodes.browser.mode=manual` + `node` | 强制使用指定节点 |
+
+### 三、关键代码片段
+
+#### 1. Profile解析
+```typescript
+// 从query或body中提取profile名称，优先query
+const queryProfile = params.query?.profile as string;
+const bodyProfile = params.body?.profile as string;
+```
+
+#### 2. 远程节点选择策略
+```typescript
+// 策略：off > manual > auto
+// off: 禁用节点
+// manual: 需要显式指定
+// auto: 单节点自动用，多节点需要配置
+```
+
+#### 3. 权限校验
+```typescript
+// 检查browser.proxy命令是否被允许
+const allowed = isNodeCommandAllowed({
+  command: "browser.proxy",
+  declaredCommands: nodeTarget.commands,
+  allowlist,
+});
+```
+
+#### 4. 代理文件处理
+```typescript
+// 远程节点可能返回base64编码的文件（如截图）
+// 需要持久化到本地并替换路径引用
+const mapping = await persistProxyFiles(proxy.files);
+applyProxyPaths(proxy.result, mapping);
+```
+
+---
+
+## 安全设计要点
+
+1. **持久化操作禁止**：禁止通过API创建/删除profile，防止恶意操作
+2. **命令白名单**：远程节点必须配置`browser.proxy`命令白名单
+3. **参数校验**：所有输入都必须校验，防止注入攻击
+4. **错误隔离**：区分4xx（请求错误）和5xx（服务错误）

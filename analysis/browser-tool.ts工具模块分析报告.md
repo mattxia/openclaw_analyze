@@ -1,72 +1,124 @@
+# browser-tool.ts 工具模块分析报告
+
+## 文件概述
+
+[browser-tool.ts](file:///d:/prj/openclaw_analyze/src/agents/tools/browser-tool.ts) 是OpenClaw智能体调用浏览器控制能力的统一工具入口。它封装了所有浏览器操作，为AI代理提供一致的浏览器控制接口，是智能体层与浏览器控制服务之间的桥梁。
+
+---
+
+## 核心架构流程图
+
+```mermaid
+flowchart TD
+    A[智能体调用browser工具] --> B{解析action参数}
+    B --> C{是否指定node节点?}
+    C -->|是| D[调用远程节点浏览器代理]
+    C -->|否| E{指定target?<br/>sandbox/host/node}
+    E -->|sandbox| F[使用沙箱浏览器URL]
+    E -->|host| G[使用本地浏览器控制服务]
+    E -->|未指定| H[默认行为]
+
+    D --> I[callBrowserProxy<br/>远程节点代理调用]
+    I --> J{执行具体action}
+
+    F --> K[resolveBrowserBaseUrl<br/>解析基础URL]
+    G --> K
+    H --> K
+
+    K --> L[创建proxyRequest函数<br/>或直接调用本地API]
+    L --> J
+
+    subgraph J [Action执行]
+        J1[status/start/stop] --> JX[返回状态]
+        J2[profiles/tabs] --> JX
+        J3[open/focus/close] --> JX
+        J4[snapshot/screenshot] --> JX
+        J5[navigate/act] --> JX
+    end
+```
+
+---
+
+## 全文注释
+
+```typescript
 // ============================================================
-// browser-tool.ts - 智能体浏览器控制工具模块
-//
-// 功能说明：
-// 本模块是OpenClaw智能体调用浏览器控制能力的统一工具入口。
-// 封装了所有浏览器操作（status/start/stop/profiles/tabs/open/snapshot/screenshot/act等），
-// 为AI代理提供一致的浏览器控制接口。
-//
-// 核心概念：
-// - target：浏览器目标位置 (sandbox|host|node)
-//   * sandbox: 使用沙箱浏览器（隔离环境）
-//   * host: 使用宿主机浏览器（可访问用户已登录状态）
-//   * node: 使用远程节点上的浏览器（通过节点代理）
-// - profile：浏览器配置（openclaw默认隔离/用户浏览器）
-// - node：远程浏览器代理节点
-//
-// 作者：OpenClaw分析
+// 导入依赖
 // ============================================================
 
-// 用于生成幂等性密钥，确保代理请求可重复执行
-import crypto from "node:crypto";
+import crypto from "node:crypto"; // 用于生成幂等性密钥
+
+// 浏览器客户端操作函数（底层CDP操作封装）
 import {
-  browserAct,
-  browserArmDialog,
-  browserArmFileChooser,
-  browserNavigate,
-  browserPdfSave,
-  browserScreenshotAction,
+  browserAct,              // 执行浏览器操作（点击、输入等）
+  browserArmDialog,       // 处理浏览器对话框
+  browserArmFileChooser,  // 处理文件选择器
+  browserNavigate,        // 导航到指定URL
+  browserPdfSave,          // 保存页面为PDF
+  browserScreenshotAction, // 截图
 } from "../../browser/client-actions.js";
+
+// 浏览器客户端API函数（浏览器生命周期管理）
 import {
-  browserCloseTab,
-  browserFocusTab,
-  browserOpenTab,
-  browserProfiles,
-  browserStart,
-  browserStatus,
-  browserStop,
+  browserCloseTab,   // 关闭标签页
+  browserFocusTab,   // 聚焦标签页
+  browserOpenTab,    // 打开新标签页
+  browserProfiles,   // 获取浏览器配置文件列表
+  browserStart,      // 启动浏览器
+  browserStatus,     // 获取浏览器状态
+  browserStop,       // 停止浏览器
 } from "../../browser/client.js";
+
+// 浏览器配置解析
 import { resolveBrowserConfig, resolveProfile } from "../../browser/config.js";
+
+// 路径处理
 import { DEFAULT_UPLOAD_DIR, resolveExistingPathsWithinRoot } from "../../browser/paths.js";
+
+// Profile能力检测
 import { getBrowserProfileCapabilities } from "../../browser/profile-capabilities.js";
+
+// 代理文件处理（远程节点场景）
 import { applyBrowserProxyPaths, persistBrowserProxyFiles } from "../../browser/proxy-files.js";
-import {
-  trackSessionBrowserTab,
-  untrackSessionBrowserTab,
-} from "../../browser/session-tab-registry.js";
+
+// 会话标签页追踪
+import { trackSessionBrowserTab, untrackSessionBrowserTab } from "../../browser/session-tab-registry.js";
+
+// 配置加载
 import { loadConfig } from "../../config/config.js";
+
+// 浏览器工具操作执行器
 import {
-  executeActAction,
-  executeConsoleAction,
-  executeSnapshotAction,
-  executeTabsAction,
+  executeActAction,       // 执行UI自动化操作
+  executeConsoleAction,   // 执行控制台操作
+  executeSnapshotAction,  // 执行页面快照
+  executeTabsAction,      // 执行标签页操作
 } from "./browser-tool.actions.js";
+
+// 工具Schema定义
 import { BrowserToolSchema } from "./browser-tool.schema.js";
+
+// 通用工具类型和辅助函数
 import { type AnyAgentTool, imageResultFromFile, jsonResult, readStringParam } from "./common.js";
+
+// Gateway工具调用
 import { callGatewayTool } from "./gateway.js";
+
+// 节点工具函数
 import {
-  listNodes,
-  resolveNodeIdFromList,
-  selectDefaultNodeFromList,
+  listNodes,                     // 列出所有节点
+  resolveNodeIdFromList,         // 从列表中解析节点ID
+  selectDefaultNodeFromList,     // 选择默认节点
   type NodeListNode,
 } from "./nodes-utils.js";
 
+// ============================================================
+// 工具函数：解析可选参数
+// ============================================================
+
 /**
  * 解析targetId和timeoutMs可选参数
- * 用于需要目标标签页ID和超时的操作（如上传、对话框等）
- *
- * @param params - 参数字典
- * @returns 包含targetId和timeoutMs的对象
+ * 用于需要目标标签页ID和超时的操作
  */
 function readOptionalTargetAndTimeout(params: Record<string, unknown>) {
   const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
@@ -80,9 +132,6 @@ function readOptionalTargetAndTimeout(params: Record<string, unknown>) {
 /**
  * 解析目标URL参数
  * 支持targetUrl和url两个参数名，url为必需
- *
- * @param params - 参数字典
- * @returns 目标URL字符串
  */
 function readTargetUrlParam(params: Record<string, unknown>) {
   return (
@@ -91,42 +140,34 @@ function readTargetUrlParam(params: Record<string, unknown>) {
   );
 }
 
+// ============================================================
+// 遗留兼容：旧版act请求参数处理
+// ============================================================
+
 /**
  * 旧版浏览器act请求的参数key列表
- * 用于兼容旧的API调用方式（参数平铺在顶层）
+ * 用于兼容旧的API调用方式
  */
 const LEGACY_BROWSER_ACT_REQUEST_KEYS = [
-  "targetId",
-  "ref",
-  "doubleClick",
-  "button",
-  "modifiers",
-  "text",
-  "submit",
-  "slowly",
-  "key",
-  "delayMs",
-  "startRef",
-  "endRef",
-  "values",
-  "fields",
-  "width",
-  "height",
-  "timeMs",
-  "textGone",
-  "selector",
-  "url",
-  "loadState",
-  "fn",
-  "timeoutMs",
+  "targetId", "ref", "doubleClick", "button", "modifiers", "text", "submit", "slowly",
+  "key", "delayMs", "startRef", "endRef", "values", "fields", "width", "height",
+  "timeMs", "textGone", "selector", "url", "loadState", "fn", "timeoutMs",
 ] as const;
 
+/**
+ * 解析act请求参数
+ * 支持两种格式：
+ * 1. 新版：request对象直接传递
+ * 2. 旧版：各参数平铺在顶层
+ */
 function readActRequestParam(params: Record<string, unknown>) {
+  // 新版格式：request参数直接传递对象
   const requestParam = params.request;
   if (requestParam && typeof requestParam === "object") {
     return requestParam as Parameters<typeof browserAct>[1];
   }
 
+  // 旧版格式：各参数平铺
   const kind = readStringParam(params, "kind");
   if (!kind) {
     return undefined;
@@ -142,24 +183,30 @@ function readActRequestParam(params: Record<string, unknown>) {
   return request as Parameters<typeof browserAct>[1];
 }
 
+// ============================================================
+// 代理类型定义（用于远程节点场景）
+// ============================================================
+
 /**
- * 代理文件类型定义
- * 远程节点返回的文件（如截图）需要以base64形式传输到本地
+ * 代理文件类型：远程节点返回的文件需要以base64形式传输到本地
  */
 type BrowserProxyFile = {
-  path: string; // 文件路径（远程节点上的路径）
-  base64: string; // 文件内容的base64编码
+  path: string;      // 文件路径
+  base64: string;   // 文件内容的base64编码
   mimeType?: string; // MIME类型（可选）
 };
 
 /**
- * 代理结果类型定义
- * 远程节点返回的完整响应，包含操作结果和可能的文件
+ * 代理结果类型：远程节点返回的完整响应
  */
 type BrowserProxyResult = {
-  result: unknown; // 操作结果
+  result: unknown;          // 操作结果
   files?: BrowserProxyFile[]; // 附带文件（如果有，如截图）
 };
+
+// ============================================================
+// 常量定义
+// ============================================================
 
 /**
  * 浏览器代理默认超时时间：20秒
@@ -168,25 +215,25 @@ const DEFAULT_BROWSER_PROXY_TIMEOUT_MS = 20_000;
 
 /**
  * Gateway超时缓冲时间：5秒
- * 代理超时 = 请求超时 + 缓冲时间，确保Gateway有足够时间处理
+ * 代理超时 = 请求超时 + 缓冲时间
  */
 const BROWSER_PROXY_GATEWAY_TIMEOUT_SLACK_MS = 5_000;
 
 /**
  * 浏览器节点目标类型
- * 用于记录解析出的远程浏览器节点信息
  */
 type BrowserNodeTarget = {
-  nodeId: string; // 节点ID
-  label?: string; // 显示名称（可选）
+  nodeId: string;  // 节点ID
+  label?: string; // 显示名称
 };
+
+// ============================================================
+// 节点判断与解析
+// ============================================================
 
 /**
  * 判断一个节点是否为浏览器节点
  * 条件：具有browser capability 或 支持 browser.proxy 命令
- *
- * @param node - 节点信息
- * @returns 是否为浏览器节点
  */
 function isBrowserNode(node: NodeListNode) {
   const caps = Array.isArray(node.caps) ? node.caps : [];
@@ -197,9 +244,7 @@ function isBrowserNode(node: NodeListNode) {
 /**
  * 解析目标浏览器节点
  *
- * 功能说明：
- * 根据配置和参数解析出远程浏览器代理节点。
- * 支持三种模式（mode）：
+ * 模式（mode）说明：
  * - "off": 完全禁用节点代理
  * - "manual": 需要手动指定节点
  * - "auto": 自动选择单节点，多节点需配置
@@ -208,39 +253,44 @@ function isBrowserNode(node: NodeListNode) {
  * - "sandbox": 使用沙箱浏览器
  * - "host": 使用宿主机浏览器
  * - "node": 强制使用远程节点
- *
- * @param params - 解析参数
- * @param params.requestedNode - 请求中指定的节点
- * @param params.target - 目标类型
- * @param params.sandboxBridgeUrl - 沙箱桥接URL
- * @returns 节点目标信息，如果不需要代理则返回null
  */
 async function resolveBrowserNodeTarget(params: {
-  requestedNode?: string;
-  target?: "sandbox" | "host" | "node";
-  sandboxBridgeUrl?: string;
+  requestedNode?: string;    // 请求中指定的节点
+  target?: "sandbox" | "host" | "node"; // 目标类型
+  sandboxBridgeUrl?: string; // 沙箱桥接URL
 }): Promise<BrowserNodeTarget | null> {
   const cfg = loadConfig();
   const policy = cfg.gateway?.nodes?.browser;
   const mode = policy?.mode ?? "auto";
+
+  // off模式：禁用节点代理
   if (mode === "off") {
     if (params.target === "node" || params.requestedNode) {
       throw new Error("Node browser proxy is disabled (gateway.nodes.browser.mode=off).");
     }
     return null;
   }
+
+  // 有沙箱URL时使用沙箱
   if (params.sandboxBridgeUrl?.trim() && params.target !== "node" && !params.requestedNode) {
     return null;
   }
+
+  // 仅当明确指定为node时才使用节点
   if (params.target && params.target !== "node") {
     return null;
   }
+
+  // manual模式需要显式指定
   if (mode === "manual" && params.target !== "node" && !params.requestedNode) {
     return null;
   }
 
+  // 获取所有已连接的浏览器节点
   const nodes = await listNodes({});
   const browserNodes = nodes.filter((node) => node.connected && isBrowserNode(node));
+
+  // 没有可用节点
   if (browserNodes.length === 0) {
     if (params.target === "node" || params.requestedNode) {
       throw new Error("No connected browser-capable nodes.");
@@ -248,6 +298,7 @@ async function resolveBrowserNodeTarget(params: {
     return null;
   }
 
+  // 显式指定了节点
   const requested = params.requestedNode?.trim() || policy?.node?.trim();
   if (requested) {
     const nodeId = resolveNodeIdFromList(browserNodes, requested, false);
@@ -255,11 +306,13 @@ async function resolveBrowserNodeTarget(params: {
     return { nodeId, label: node?.displayName ?? node?.remoteIp ?? nodeId };
   }
 
+  // 自动选择默认节点
   const selected = selectDefaultNodeFromList(browserNodes, {
     preferLocalMac: false,
     fallback: "none",
   });
 
+  // 强制使用节点模式
   if (params.target === "node") {
     if (selected) {
       return {
@@ -268,14 +321,16 @@ async function resolveBrowserNodeTarget(params: {
       };
     }
     throw new Error(
-      `Multiple browser-capable nodes connected (${browserNodes.length}). Set gateway.nodes.browser.node or pass node=<id>.`,
+      `Multiple browser-capable nodes connected (${browserNodes.length}). Set gateway.nodes.browser.node or pass node=<id|name>.`,
     );
   }
 
+  // manual模式
   if (mode === "manual") {
     return null;
   }
 
+  // 有单个节点时自动使用
   if (selected) {
     return {
       nodeId: selected.nodeId,
@@ -285,28 +340,13 @@ async function resolveBrowserNodeTarget(params: {
   return null;
 }
 
+// ============================================================
+// 远程节点代理调用
+// ============================================================
+
 /**
  * 调用远程节点浏览器代理
- *
- * 功能说明：
- * 将浏览器请求转发到远程节点执行，并处理返回结果。
- * 这是实现远程浏览器控制的核心函数。
- *
- * 处理流程：
- * 1. 计算超时时间（请求超时 + Gateway缓冲）
- * 2. 通过Gateway的node.invoke接口发送代理请求
- * 3. 解析远程节点返回的响应
- * 4. 返回包含结果和可能的文件
- *
- * @param params - 代理请求参数
- * @param params.nodeId - 目标节点ID
- * @param params.method - HTTP方法
- * @param params.path - 请求路径
- * @param params.query - 查询参数
- * @param params.body - 请求体
- * @param params.timeoutMs - 超时时间
- * @param params.profile - 浏览器配置
- * @returns 代理结果
+ * 将请求转发到远程节点执行，并处理返回结果
  */
 async function callBrowserProxy(params: {
   nodeId: string;
@@ -317,11 +357,14 @@ async function callBrowserProxy(params: {
   timeoutMs?: number;
   profile?: string;
 }): Promise<BrowserProxyResult> {
+  // 计算超时时间
   const proxyTimeoutMs =
     typeof params.timeoutMs === "number" && Number.isFinite(params.timeoutMs)
       ? Math.max(1, Math.floor(params.timeoutMs))
       : DEFAULT_BROWSER_PROXY_TIMEOUT_MS;
   const gatewayTimeoutMs = proxyTimeoutMs + BROWSER_PROXY_GATEWAY_TIMEOUT_SLACK_MS;
+
+  // 调用Gateway的node.invoke接口
   const payload = await callGatewayTool<{ payloadJSON?: string; payload?: string }>(
     "node.invoke",
     { timeoutMs: gatewayTimeoutMs },
@@ -336,14 +379,17 @@ async function callBrowserProxy(params: {
         timeoutMs: proxyTimeoutMs,
         profile: params.profile,
       },
-      idempotencyKey: crypto.randomUUID(),
+      idempotencyKey: crypto.randomUUID(), // 生成幂等性密钥
     },
   );
+
+  // 解析响应
   const parsed =
     payload?.payload ??
     (typeof payload?.payloadJSON === "string" && payload.payloadJSON
       ? (JSON.parse(payload.payloadJSON) as BrowserProxyResult)
       : null);
+
   if (!parsed || typeof parsed !== "object" || !("result" in parsed)) {
     throw new Error("browser proxy failed");
   }
@@ -352,13 +398,6 @@ async function callBrowserProxy(params: {
 
 /**
  * 将远程节点返回的代理文件持久化到本地
- *
- * 功能说明：
- * 远程节点返回的文件（如截图）是以base64编码传输的，
- * 此函数将文件写入本地文件系统，并返回路径映射。
- *
- * @param files - 代理文件列表
- * @returns 路径映射（远程路径 -> 本地路径）
  */
 async function persistProxyFiles(files: BrowserProxyFile[] | undefined) {
   return await persistBrowserProxyFiles(files);
@@ -366,33 +405,22 @@ async function persistProxyFiles(files: BrowserProxyFile[] | undefined) {
 
 /**
  * 应用代理文件路径映射到结果中
- *
- * 功能说明：
- * 将结果中的远程文件路径替换为本地持久化后的路径。
- *
- * @param result - 操作结果
- * @param mapping - 路径映射（远程路径 -> 本地路径）
  */
 function applyProxyPaths(result: unknown, mapping: Map<string, string>) {
   applyBrowserProxyPaths(result, mapping);
 }
 
+// ============================================================
+// 浏览器基础URL解析
+// ============================================================
+
 /**
  * 解析浏览器基础URL
+ * 根据target参数决定使用沙箱浏览器还是宿主机浏览器
  *
- * 功能说明：
- * 根据target参数决定使用沙箱浏览器还是宿主机浏览器。
- *
- * 路由逻辑：
- * 1. 如果target="sandbox"且有沙箱URL，使用沙箱浏览器
- * 2. 如果allowHostControl=false，禁止使用宿主机
- * 3. 如果浏览器控制未启用，抛出错误
- * 4. 否则返回undefined表示使用本地服务
- *
- * @param params - 解析参数
- * @param params.target - 目标类型（sandbox/host）
- * @param params.sandboxBridgeUrl - 沙箱桥接URL
- * @param params.allowHostControl - 是否允许控制宿主机
+ * @param target - 目标类型：sandbox/host
+ * @param sandboxBridgeUrl - 沙箱桥接URL
+ * @param allowHostControl - 是否允许控制宿主机浏览器
  * @returns 浏览器基础URL，undefined表示使用默认本地服务
  */
 function resolveBrowserBaseUrl(params: {
@@ -405,35 +433,38 @@ function resolveBrowserBaseUrl(params: {
   const normalizedSandbox = params.sandboxBridgeUrl?.trim() ?? "";
   const target = params.target ?? (normalizedSandbox ? "sandbox" : "host");
 
+  // 使用沙箱浏览器
   if (target === "sandbox") {
     if (!normalizedSandbox) {
       throw new Error(
         'Sandbox browser is unavailable. Enable agents.defaults.sandbox.browser.enabled or use target="host" if allowed.',
       );
     }
-    return normalizedSandbox.replace(/\/$/, "");
+    return normalizedSandbox.replace(/\/$/, ""); // 去除末尾斜杠
   }
 
+  // 检查是否允许控制宿主机
   if (params.allowHostControl === false) {
     throw new Error("Host browser control is disabled by sandbox policy.");
   }
+
+  // 检查浏览器控制是否启用
   if (!resolved.enabled) {
     throw new Error(
       "Browser control is disabled. Set browser.enabled=true in ~/.openclaw/openclaw.json.",
     );
   }
-  return undefined;
+
+  return undefined; // 返回undefined表示使用本地服务
 }
+
+// ============================================================
+// Profile判断：是否应该使用用户浏览器
+// ============================================================
 
 /**
  * 判断是否为用户浏览器Profile
- *
- * 功能说明：
- * 用户浏览器Profile（如existing-session、extension relay）只能在宿主机使用，
- * 不能用于沙箱环境。此函数检查指定的profile是否为用户浏览器类型。
- *
- * @param profileName - Profile名称
- * @returns 是否应该优先使用宿主机浏览器
+ * 用户浏览器Profile（existing-session、extension relay）只能在宿主机使用
  */
 function shouldPreferHostForProfile(profileName: string | undefined) {
   if (!profileName) {
@@ -449,54 +480,33 @@ function shouldPreferHostForProfile(profileName: string | undefined) {
   return capabilities.requiresRelay || capabilities.usesChromeMcp;
 }
 
+// ============================================================
+// 核心：创建浏览器工具
+// ============================================================
+
 /**
- * 创建浏览器工具 - 核心工厂函数
+ * 创建浏览器工具
+ * 这是对外暴露的核心工厂函数
  *
- * 功能说明：
- * 创建并返回AI代理可使用的浏览器控制工具。
- * 这是本模块对外暴露的主要接口。
- *
- * 参数说明：
- * @param opts.sandboxBridgeUrl - 沙箱桥接URL（可选）
- * @param opts.allowHostControl - 是否允许控制宿主机浏览器（可选）
+ * @param opts - 可选配置
+ * @param opts.sandboxBridgeUrl - 沙箱桥接URL
+ * @param opts.allowHostControl - 是否允许控制宿主机浏览器
  * @param opts.agentSessionKey - 智能体会话Key（用于追踪标签页）
- *
- * 返回值：
- * 返回一个符合AnyAgentTool接口的工具对象，包含：
- * - label: 工具显示名称
- * - name: 工具名称
- * - description: 工具描述说明
- * - parameters: 工具参数Schema
- * - execute: 执行函数
- *
- * 执行流程（execute函数）：
- * 1. 解析基础参数（action, profile, node, target）
- * 2. 参数校验（node与target兼容性、用户浏览器Profile检查）
- * 3. 解析目标节点（resolveBrowserNodeTarget）
- * 4. 解析基础URL（resolveBrowserBaseUrl）
- * 5. 创建代理请求函数（如果有远程节点）
- * 6. 根据action执行相应操作
- *
- * 支持的action列表：
- * - status/start/stop: 浏览器生命周期管理
- * - profiles/tabs: 配置和标签页查询
- * - open/focus/close: 标签页操作
- * - snapshot/screenshot: 页面捕获
- * - navigate: 导航
- * - console: 控制台操作
- * - pdf: PDF导出
- * - upload/dialog: 交互操作
- * - act: UI自动化操作
  */
 export function createBrowserTool(opts?: {
   sandboxBridgeUrl?: string;
   allowHostControl?: boolean;
   agentSessionKey?: string;
 }): AnyAgentTool {
+  // 确定默认target
   const targetDefault = opts?.sandboxBridgeUrl ? "sandbox" : "host";
+
+  // 生成host提示信息
   const hostHint =
     opts?.allowHostControl === false ? "Host target blocked by policy." : "Host target allowed.";
+
   return {
+    // ---- 工具元信息 ----
     label: "Browser",
     name: "browser",
     description: [
@@ -511,17 +521,12 @@ export function createBrowserTool(opts?: {
       hostHint,
     ].join(" "),
     parameters: BrowserToolSchema,
-    // ============================================================
-    // execute函数 - 浏览器工具执行入口
-    // ============================================================
+
+    // ---- 核心执行函数 ----
     execute: async (_toolCallId, args) => {
       const params = args as Record<string, unknown>;
 
       // ---- 1. 解析基础参数 ----
-      // action: 必须参数，指定要执行的浏览器操作类型
-      // profile: 浏览器配置名称（如"openclaw"、"user"等）
-      // node: 远程节点ID或名称（可选）
-      // target: 浏览器目标位置（sandbox|host|node）
       const action = readStringParam(params, "action", { required: true });
       const profile = readStringParam(params, "profile");
       const requestedNode = readStringParam(params, "node");
@@ -532,7 +537,8 @@ export function createBrowserTool(opts?: {
       if (requestedNode && target && target !== "node") {
         throw new Error('node is only supported with target="node".');
       }
-      // 用户浏览器Profile（existing-session、extension relay）只能在宿主机使用
+
+      // 用户浏览器Profile只能在宿主机使用
       const isUserBrowserProfile = shouldPreferHostForProfile(profile);
       if (isUserBrowserProfile) {
         if (requestedNode || target === "node") {
@@ -549,8 +555,6 @@ export function createBrowserTool(opts?: {
       }
 
       // ---- 3. 解析目标节点 ----
-      // 根据配置和参数解析远程浏览器代理节点
-      // 可能返回null（使用本地浏览器）或节点信息（使用远程节点）
       const nodeTarget = await resolveBrowserNodeTarget({
         requestedNode: requestedNode ?? undefined,
         target,
@@ -558,8 +562,6 @@ export function createBrowserTool(opts?: {
       });
 
       // ---- 4. 解析基础URL ----
-      // 确定浏览器服务的基础URL
-      // 如果有nodeTarget则不需要baseUrl（代理模式）
       const resolvedTarget = target === "node" ? undefined : target;
       const baseUrl = nodeTarget
         ? undefined
@@ -571,7 +573,7 @@ export function createBrowserTool(opts?: {
 
       // ---- 5. 创建代理请求函数 ----
       // 如果有远程节点目标，创建代理请求函数
-      // 否则为null，直接调用本地浏览器控制API
+      // 否则为null，直接调用本地API
       const proxyRequest = nodeTarget
         ? async (opts: {
             method: string;
@@ -581,7 +583,6 @@ export function createBrowserTool(opts?: {
             timeoutMs?: number;
             profile?: string;
           }) => {
-            // 调用远程节点浏览器代理
             const proxy = await callBrowserProxy({
               nodeId: nodeTarget.nodeId,
               method: opts.method,
@@ -591,18 +592,15 @@ export function createBrowserTool(opts?: {
               timeoutMs: opts.timeoutMs,
               profile: opts.profile,
             });
-            // 处理返回的文件（远程节点的文件以base64传输）
             const mapping = await persistProxyFiles(proxy.files);
-            // 应用路径映射到结果
             applyProxyPaths(proxy.result, mapping);
             return proxy.result;
           }
         : null;
 
       // ---- 6. 执行具体action ----
-      // 根据action参数分发到不同的处理函数
       switch (action) {
-        // ---------- 状态操作：获取浏览器状态 ----------
+        // ---------- 状态操作 ----------
         case "status":
           if (proxyRequest) {
             return jsonResult(
@@ -615,10 +613,8 @@ export function createBrowserTool(opts?: {
           }
           return jsonResult(await browserStatus(baseUrl, { profile }));
 
-        // ---------- 启动浏览器 ----------
         case "start":
           if (proxyRequest) {
-            // 代理模式：先启动，再获取状态
             await proxyRequest({
               method: "POST",
               path: "/start",
@@ -632,11 +628,9 @@ export function createBrowserTool(opts?: {
               }),
             );
           }
-          // 本地模式：先启动，再获取状态
           await browserStart(baseUrl, { profile });
           return jsonResult(await browserStatus(baseUrl, { profile }));
 
-        // ---------- 停止浏览器 ----------
         case "stop":
           if (proxyRequest) {
             await proxyRequest({
@@ -655,7 +649,6 @@ export function createBrowserTool(opts?: {
           await browserStop(baseUrl, { profile });
           return jsonResult(await browserStatus(baseUrl, { profile }));
 
-        // ---------- 获取可用Profile列表 ----------
         case "profiles":
           if (proxyRequest) {
             const result = await proxyRequest({
@@ -666,11 +659,10 @@ export function createBrowserTool(opts?: {
           }
           return jsonResult({ profiles: await browserProfiles(baseUrl) });
 
-        // ---------- 获取标签页列表 ----------
+        // ---------- 标签页操作 ----------
         case "tabs":
           return await executeTabsAction({ baseUrl, profile, proxyRequest });
 
-        // ---------- 打开新标签页 ----------
         case "open": {
           const targetUrl = readTargetUrlParam(params);
           if (proxyRequest) {
@@ -682,8 +674,8 @@ export function createBrowserTool(opts?: {
             });
             return jsonResult(result);
           }
-          // 打开新标签页并追踪（用于会话管理）
           const opened = await browserOpenTab(baseUrl, targetUrl, { profile });
+          // 追踪新打开的标签页
           trackSessionBrowserTab({
             sessionKey: opts?.agentSessionKey,
             targetId: opened.targetId,
@@ -693,11 +685,8 @@ export function createBrowserTool(opts?: {
           return jsonResult(opened);
         }
 
-        // ---------- 聚焦标签页 ----------
         case "focus": {
-          const targetId = readStringParam(params, "targetId", {
-            required: true,
-          });
+          const targetId = readStringParam(params, "targetId", { required: true });
           if (proxyRequest) {
             const result = await proxyRequest({
               method: "POST",
@@ -711,7 +700,6 @@ export function createBrowserTool(opts?: {
           return jsonResult({ ok: true });
         }
 
-        // ---------- 关闭标签页 ----------
         case "close": {
           const targetId = readStringParam(params, "targetId");
           if (proxyRequest) {
@@ -730,7 +718,6 @@ export function createBrowserTool(opts?: {
             return jsonResult(result);
           }
           if (targetId) {
-            // 指定targetId时直接关闭该标签页
             await browserCloseTab(baseUrl, targetId, { profile });
             // 取消追踪已关闭的标签页
             untrackSessionBrowserTab({
@@ -740,13 +727,12 @@ export function createBrowserTool(opts?: {
               profile,
             });
           } else {
-            // 未指定targetId时执行关闭当前标签页操作
             await browserAct(baseUrl, { kind: "close" }, { profile });
           }
           return jsonResult({ ok: true });
         }
 
-        // ---------- 页面快照（获取页面结构和ARIA引用） ----------
+        // ---------- 页面操作 ----------
         case "snapshot":
           return await executeSnapshotAction({
             input: params,
@@ -755,7 +741,6 @@ export function createBrowserTool(opts?: {
             proxyRequest,
           });
 
-        // ---------- 截图 ----------
         case "screenshot": {
           const targetId = readStringParam(params, "targetId");
           const fullPage = Boolean(params.fullPage);
@@ -783,7 +768,6 @@ export function createBrowserTool(opts?: {
                 type,
                 profile,
               });
-          // 返回图片结果（包含文件路径和元数据）
           return await imageResultFromFile({
             label: "browser:screenshot",
             path: result.path,
@@ -791,7 +775,6 @@ export function createBrowserTool(opts?: {
           });
         }
 
-        // ---------- 导航到指定URL ----------
         case "navigate": {
           const targetUrl = readTargetUrlParam(params);
           const targetId = readStringParam(params, "targetId");
@@ -816,7 +799,6 @@ export function createBrowserTool(opts?: {
           );
         }
 
-        // ---------- 控制台操作 ----------
         case "console":
           return await executeConsoleAction({
             input: params,
@@ -825,7 +807,6 @@ export function createBrowserTool(opts?: {
             proxyRequest,
           });
 
-        // ---------- 导出PDF ----------
         case "pdf": {
           const targetId = typeof params.targetId === "string" ? params.targetId.trim() : undefined;
           const result = proxyRequest
@@ -848,7 +829,6 @@ export function createBrowserTool(opts?: {
           if (paths.length === 0) {
             throw new Error("paths required");
           }
-          // 验证上传路径是否在允许的目录范围内
           const uploadPathsResult = await resolveExistingPathsWithinRoot({
             rootDir: DEFAULT_UPLOAD_DIR,
             requestedPaths: paths,
@@ -891,7 +871,7 @@ export function createBrowserTool(opts?: {
           );
         }
 
-        // ---------- 对话框处理（确认/取消/提示输入） ----------
+        // ---------- 对话框处理 ----------
         case "dialog": {
           const accept = Boolean(params.accept);
           const promptText = typeof params.promptText === "string" ? params.promptText : undefined;
@@ -921,7 +901,7 @@ export function createBrowserTool(opts?: {
           );
         }
 
-        // ---------- UI自动化操作（点击、输入、滚动等） ----------
+        // ---------- UI自动化操作 ----------
         case "act": {
           const request = readActRequestParam(params);
           if (!request) {
@@ -942,3 +922,78 @@ export function createBrowserTool(opts?: {
     },
   };
 }
+```
+
+---
+
+## 主要功能分类
+
+### 1. 生命周期管理（status/start/stop）
+```typescript
+// 启动浏览器
+case "start":
+  await browserStart(baseUrl, { profile });
+  return jsonResult(await browserStatus(baseUrl, { profile }));
+```
+
+### 2. 标签页操作（tabs/open/focus/close）
+```typescript
+// 打开新标签页并追踪
+case "open": {
+  const opened = await browserOpenTab(baseUrl, targetUrl, { profile });
+  trackSessionBrowserTab({ sessionKey: opts?.agentSessionKey, targetId: opened.targetId, baseUrl, profile });
+  return jsonResult(opened);
+}
+```
+
+### 3. 页面捕获（snapshot/screenshot）
+```typescript
+// 截图返回图片文件
+case "screenshot": {
+  const result = await browserScreenshotAction(baseUrl, { targetId, fullPage, ref, element, type, profile });
+  return await imageResultFromFile({ label: "browser:screenshot", path: result.path, details: result });
+}
+```
+
+### 4. UI自动化（navigate/act）
+```typescript
+// 执行UI操作（点击、输入等）
+case "act": {
+  const request = readActRequestParam(params);
+  return await executeActAction({ request, baseUrl, profile, proxyRequest });
+}
+```
+
+### 5. 远程节点代理
+```typescript
+// 通过远程节点执行浏览器操作
+const proxyRequest = nodeTarget
+  ? async (opts) => {
+      const proxy = await callBrowserProxy({ nodeId: nodeTarget.nodeId, ... });
+      const mapping = await persistProxyFiles(proxy.files);
+      applyProxyPaths(proxy.result, mapping);
+      return proxy.result;
+    }
+  : null;
+```
+
+---
+
+## 与browser.ts的区别
+
+| 对比项 | browser-tool.ts | browser.ts |
+|--------|-----------------|------------|
+| **位置** | `src/agents/tools/` | `src/gateway/server-methods/` |
+| **层级** | 智能体工具层 | Gateway服务层 |
+| **调用方** | AI智能体 | CLI/API客户端 |
+| **职责** | 解析参数、路由决策、执行action | HTTP请求路由、节点代理、响应处理 |
+| **核心函数** | `createBrowserTool()` | `browserHandlers.browser.request()` |
+
+---
+
+## 安全设计要点
+
+1. **Profile隔离**：用户浏览器Profile（existing-session、extension relay）只能在宿主机使用，不能用于沙箱
+2. **节点权限检查**：使用远程节点前会检查`browser.proxy`命令是否在允许列表中
+3. **Target校验**：`node`参数只能与`target="node"`一起使用，防止误用
+4. **沙箱策略**：`allowHostControl`参数可控制是否允许在沙箱环境中控制宿主机浏览器
