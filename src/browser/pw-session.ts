@@ -1,3 +1,58 @@
+/**
+ * @file pw-session.ts
+ *
+ * @desc Playwright 浏览器会话管理核心模块
+ *
+ * ## 主要功能
+ *
+ * ### 1. 浏览器连接管理
+ * - `connectBrowser()`: 通过 Chrome DevTools Protocol (CDP) WebSocket 连接浏览器
+ * - 支持连接重试机制（最多3次）
+ * - 连接缓存：相同 CDP URL 不会重复建立连接
+ * - `closePlaywrightBrowserConnection()`: 关闭浏览器连接
+ * - `forceDisconnectPlaywrightForTarget()`: 强制断开目标连接（用于取消卡住的操�)
+ *
+ * ### 2. 页面状态追踪
+ * - `ensurePageState()`: 为每个页面维护状态快照
+ *   - console 消息（最多500条）
+ *   - 页面错误（最多200条）
+ *   - 网络请求（最多500条）
+ *   - ARIA role refs（用于 UI 元素定位）
+ *
+ * ### 3. 页面查找与解析
+ * - `findPageByTargetId()`: 通过 targetId 查找对应页面
+ * - `getPageForTargetId()`: 获取目标页面或返回第一个页面
+ * - `resolvePageByTargetIdOrThrow()`: 解析页面，不存在则抛出异常
+ * - `pageTargetId()`: 获取页面的 CDP targetId
+ *
+ * ### 4. 页面操作
+ * - `listPagesViaPlaywright()`: 列出所有页面/标签页
+ * - `createPageViaPlaywright()`: 创建新页面/标签页
+ * - `closePageByTargetIdViaPlaywright()`: 关闭指定页面
+ * - `focusPageByTargetIdViaPlaywright()`: 聚焦指定页面
+ *
+ * ### 5. Role Refs 管理
+ * - `storeRoleRefsForTarget()`: 存储页面的 ARIA role refs 缓存
+ * - `restoreRoleRefsForTarget()`: 恢复缓存的 role refs
+ * - `refLocator()`: 根据 ref 字符串获取 Playwright 定位器
+ *
+ * ### 6. CDP 执行终止
+ * - `tryTerminateExecutionViaCdp()`: 尝试通过 CDP 终止卡住的 JavaScript 执行
+ * - 用于解除页面卡死状态而不关闭整个浏览器
+ *
+ * ## 关键数据结构
+ *
+ * - `PageState`: 存储页面级状态（控制台、错误、请求、role refs）
+ * - `ContextState`: 存储浏览器上下文级状态（trace 是否激活）
+ * - `ConnectedBrowser`: 存储已连接浏览器信息及断开回调
+ *
+ * ## 缓存策略
+ *
+ * - 浏览器连接缓存: `cachedByCdpUrl` + `connectingByCdpUrl`
+ * - Role refs 缓存: `roleRefsByTarget`（最多50条，LRU 淘汰）
+ * - 弱引用状态存储: `pageStates`、`contextStates` 使用 WeakMap
+ */
+
 import type {
   Browser,
   BrowserContext,
@@ -28,6 +83,10 @@ import {
 } from "./navigation-guard.js";
 import { isExtensionRelayCdpEndpoint, withPageScopedCdpClient } from "./pw-session.page-cdp.js";
 
+/**
+ * 浏览器控制台消息结构
+ * 捕获页面 console.log() 等输出
+ */
 export type BrowserConsoleMessage = {
   type: string;
   text: string;
@@ -35,6 +94,10 @@ export type BrowserConsoleMessage = {
   location?: { url?: string; lineNumber?: number; columnNumber?: number };
 };
 
+/**
+ * 页面错误结构
+ * 捕获未处理的 JavaScript 异常
+ */
 export type BrowserPageError = {
   message: string;
   name?: string;
@@ -42,6 +105,10 @@ export type BrowserPageError = {
   timestamp: string;
 };
 
+/**
+ * 网络请求结构
+ * 记录页面发出的 HTTP 请求
+ */
 export type BrowserNetworkRequest = {
   id: string;
   timestamp: string;
@@ -56,6 +123,10 @@ export type BrowserNetworkRequest = {
 type SnapshotForAIResult = { full: string; incremental?: string };
 type SnapshotForAIOptions = { timeout?: number; track?: string };
 
+/**
+ * AI 快照功能接口
+ * 用于页面 DOM 快照提取
+ */
 export type WithSnapshotForAI = {
   _snapshotForAI?: (options?: SnapshotForAIOptions) => Promise<SnapshotForAIResult>;
 };
@@ -66,29 +137,37 @@ type TargetInfoResponse = {
   };
 };
 
+/**
+ * 已连接的浏览器实例包装
+ * 包含浏览器实例、CDP URL 和断开连接回调
+ */
 type ConnectedBrowser = {
   browser: Browser;
   cdpUrl: string;
   onDisconnected?: () => void;
 };
 
+/**
+ * 页面状态存储
+ * 使用 WeakMap 关联 Page 实例，实现自动垃圾回收
+ */
 type PageState = {
-  console: BrowserConsoleMessage[];
-  errors: BrowserPageError[];
-  requests: BrowserNetworkRequest[];
-  requestIds: WeakMap<Request, string>;
-  nextRequestId: number;
-  armIdUpload: number;
-  armIdDialog: number;
-  armIdDownload: number;
+  console: BrowserConsoleMessage[]; // 控制台消息列表
+  errors: BrowserPageError[]; // 页面错误列表
+  requests: BrowserNetworkRequest[]; // 网络请求列表
+  requestIds: WeakMap<Request, string>; // Request 对象到 ID 的映射
+  nextRequestId: number; // 自增请求 ID
+  armIdUpload: number; // Dialog 处理 ID 计数器
+  armIdDialog: number; // Dialog 处理 ID 计数器
+  armIdDownload: number; // Download 处理 ID 计数器
   /**
-   * Role-based refs from the last role snapshot (e.g. e1/e2).
-   * Mode "role" refs are generated from ariaSnapshot and resolved via getByRole.
-   * Mode "aria" refs are Playwright aria-ref ids and resolved via `aria-ref=...`.
+   * 从最后一次 role snapshot 中获取的基于角色的引用（如 e1/e2）。
+   * Mode "role" refs 从 ariaSnapshot 生成，通过 getByRole 解析。
+   * Mode "aria" refs 是 Playwright aria-ref id，通过 `aria-ref=...` 解析。
    */
   roleRefs?: Record<string, { role: string; name?: string; nth?: number }>;
-  roleRefsMode?: "role" | "aria";
-  roleRefsFrameSelector?: string;
+  roleRefsMode?: "role" | "aria"; // role refs 的解析模式
+  roleRefsFrameSelector?: string; // 如果 refs 来自 iframe，存储 frame 选择器
 };
 
 type RoleRefs = NonNullable<PageState["roleRefs"]>;
@@ -98,31 +177,62 @@ type RoleRefsCacheEntry = {
   mode?: NonNullable<PageState["roleRefsMode"]>;
 };
 
+/**
+ * 浏览器上下文状态
+ */
 type ContextState = {
-  traceActive: boolean;
+  traceActive: boolean; // 是否正在录制 trace
 };
 
+/**
+ * 弱引用状态存储
+ * 使用 WeakMap/WeakSet 实现 Page/BrowserContext 的状态关联
+ * 当对象被垃圾回收时，关联状态自动清除
+ */
 const pageStates = new WeakMap<Page, PageState>();
 const contextStates = new WeakMap<BrowserContext, ContextState>();
 const observedContexts = new WeakSet<BrowserContext>();
 const observedPages = new WeakSet<Page>();
 
-// Best-effort cache to make role refs stable even if Playwright returns a different Page object
-// for the same CDP target across requests.
+/**
+ * Role refs 缓存
+ * 使用普通 Map 存储，因为 targetId 是字符串而非对象引用
+ * 用于在跨请求保持 role refs 稳定性
+ */
 const roleRefsByTarget = new Map<string, RoleRefsCacheEntry>();
 const MAX_ROLE_REFS_CACHE = 50;
 
+/**
+ * 消息/错误/请求数量限制
+ * 防止内存泄漏，限制历史记录大小
+ */
 const MAX_CONSOLE_MESSAGES = 500;
 const MAX_PAGE_ERRORS = 200;
 const MAX_NETWORK_REQUESTS = 500;
 
+/**
+ * 浏览器连接缓存
+ * 避免同一 CDP URL 重复建立连接
+ */
 const cachedByCdpUrl = new Map<string, ConnectedBrowser>();
+/**
+ * 正在连接中的 Promise 缓存
+ * 防止并发连接同一 URL
+ */
 const connectingByCdpUrl = new Map<string, Promise<ConnectedBrowser>>();
 
+/**
+ * 标准化 CDP URL
+ * 移除末尾斜杠，保持一致性
+ */
 function normalizeCdpUrl(raw: string) {
   return raw.replace(/\/$/, "");
 }
 
+/**
+ * 通过 ID 查找网络请求记录
+ * 从后向前遍历（最近添加的更可能匹配）
+ */
 function findNetworkRequestById(state: PageState, id: string): BrowserNetworkRequest | undefined {
   for (let i = state.requests.length - 1; i >= 0; i -= 1) {
     const candidate = state.requests[i];
@@ -133,10 +243,19 @@ function findNetworkRequestById(state: PageState, id: string): BrowserNetworkReq
   return undefined;
 }
 
+/**
+ * 生成 role refs 缓存的键
+ * 组合 CDP URL 和 targetId
+ */
 function roleRefsKey(cdpUrl: string, targetId: string) {
   return `${normalizeCdpUrl(cdpUrl)}::${targetId}`;
 }
 
+/**
+ * 记住目标页面的 role refs
+ * 缓存到 Map 中，支持跨 Page 对象恢复
+ * 使用 LRU 策略，超过 MAX_ROLE_REFS_CACHE 条目时淘汰最旧的
+ */
 export function rememberRoleRefsForTarget(opts: {
   cdpUrl: string;
   targetId: string;
@@ -162,6 +281,10 @@ export function rememberRoleRefsForTarget(opts: {
   }
 }
 
+/**
+ * 存储页面 role refs
+ * 同时写入 PageState 和全局缓存
+ */
 export function storeRoleRefsForTarget(opts: {
   page: Page;
   cdpUrl: string;
@@ -186,6 +309,10 @@ export function storeRoleRefsForTarget(opts: {
   });
 }
 
+/**
+ * 恢复目标页面的 role refs
+ * 从全局缓存中查找并应用到 PageState
+ */
 export function restoreRoleRefsForTarget(opts: {
   cdpUrl: string;
   targetId?: string;
@@ -208,6 +335,11 @@ export function restoreRoleRefsForTarget(opts: {
   state.roleRefsMode = cached.mode;
 }
 
+/**
+ * 确保页面状态存在
+ * 如果页面尚未被追踪，创建新的 PageState 并注册事件监听器
+ * 使用 WeakMap 存储，当 Page 对象被 GC 时状态自动清理
+ */
 export function ensurePageState(page: Page): PageState {
   const existing = pageStates.get(page);
   if (existing) {
@@ -226,8 +358,10 @@ export function ensurePageState(page: Page): PageState {
   };
   pageStates.set(page, state);
 
+  // 仅当页面未被观察时才注册事件监听器
   if (!observedPages.has(page)) {
     observedPages.add(page);
+    // 监听控制台消息
     page.on("console", (msg: ConsoleMessage) => {
       const entry: BrowserConsoleMessage = {
         type: msg.type(),
@@ -240,6 +374,7 @@ export function ensurePageState(page: Page): PageState {
         state.console.shift();
       }
     });
+    // 监听页面错误
     page.on("pageerror", (err: Error) => {
       state.errors.push({
         message: err?.message ? String(err.message) : String(err),
@@ -251,6 +386,7 @@ export function ensurePageState(page: Page): PageState {
         state.errors.shift();
       }
     });
+    // 监听请求发起
     page.on("request", (req: Request) => {
       state.nextRequestId += 1;
       const id = `r${state.nextRequestId}`;
@@ -266,6 +402,7 @@ export function ensurePageState(page: Page): PageState {
         state.requests.shift();
       }
     });
+    // 监听响应接收
     page.on("response", (resp: Response) => {
       const req = resp.request();
       const id = state.requestIds.get(req);
@@ -279,6 +416,7 @@ export function ensurePageState(page: Page): PageState {
       rec.status = resp.status();
       rec.ok = resp.ok();
     });
+    // 监听请求失败
     page.on("requestfailed", (req: Request) => {
       const id = state.requestIds.get(req);
       if (!id) {
@@ -291,6 +429,7 @@ export function ensurePageState(page: Page): PageState {
       rec.failureText = req.failure()?.errorText;
       rec.ok = false;
     });
+    // 监听页面关闭，清理状态
     page.on("close", () => {
       pageStates.delete(page);
       observedPages.delete(page);
@@ -300,6 +439,11 @@ export function ensurePageState(page: Page): PageState {
   return state;
 }
 
+/**
+ * 观察浏览器上下文
+ * 确保上下文状态存在，并追踪其中的所有页面
+ * 新页面创建时自动注册页面状态
+ */
 function observeContext(context: BrowserContext) {
   if (observedContexts.has(context)) {
     return;
@@ -313,6 +457,9 @@ function observeContext(context: BrowserContext) {
   context.on("page", (page) => ensurePageState(page));
 }
 
+/**
+ * 确保浏览器上下文状态存在
+ */
 export function ensureContextState(context: BrowserContext): ContextState {
   const existing = contextStates.get(context);
   if (existing) {
@@ -323,12 +470,34 @@ export function ensureContextState(context: BrowserContext): ContextState {
   return state;
 }
 
+/**
+ * 观察浏览器
+ * 遍历所有上下文并观察它们
+ */
 function observeBrowser(browser: Browser) {
   for (const context of browser.contexts()) {
     observeContext(context);
   }
 }
 
+/**
+ * 连接浏览器（通过 CDP WebSocket）
+ *
+ * 连接流程：
+ * 1. 检查缓存 - 已有连接直接返回
+ * 2. 检查正在连接 - 避免重复连接
+ * 3. 执行连接重试 - 最多3次尝试
+ * 4. 注册断开回调 - 清理缓存
+ * 5. 开始观察浏览器 - 追踪页面变化
+ *
+ * 重试机制：
+ * - 首次失败后等待 250ms
+ * - 后续每次失败增加 250ms 延迟
+ * - 跳过 rate limit 错误，不重试
+ *
+ * @param cdpUrl - Chrome DevTools Protocol WebSocket URL
+ * @returns 已连接的浏览器实例和元数据
+ */
 async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
   const normalized = normalizeCdpUrl(cdpUrl);
   const cached = cachedByCdpUrl.get(normalized);
@@ -344,14 +513,17 @@ async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
     let lastErr: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
+        // 递增超时时间：5000ms -> 7000ms -> 9000ms
         const timeout = 5000 + attempt * 2000;
+        // 尝试获取 WebSocket URL 或使用原始端点
         const wsUrl = await getChromeWebSocketUrl(normalized, timeout).catch(() => null);
         const endpoint = wsUrl ?? normalized;
         const headers = getHeadersWithAuth(endpoint);
-        // Bypass proxy for loopback CDP connections (#31219)
+        // 对 loopback CDP 连接绕过代理 (#31219)
         const browser = await withNoProxyForCdpUrl(endpoint, () =>
           chromium.connectOverCDP(endpoint, { timeout, headers }),
         );
+        // 断开连接回调：清理缓存
         const onDisconnected = () => {
           const current = cachedByCdpUrl.get(normalized);
           if (current?.browser === browser) {
@@ -361,15 +533,17 @@ async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
         const connected: ConnectedBrowser = { browser, cdpUrl: normalized, onDisconnected };
         cachedByCdpUrl.set(normalized, connected);
         browser.on("disconnected", onDisconnected);
+        // 开始观察浏览器及其页面
         observeBrowser(browser);
         return connected;
       } catch (err) {
         lastErr = err;
-        // Don't retry rate-limit errors; retrying worsens the 429.
+        // 不要重试 rate limit 错误；重试会加剧 429 问题
         const errMsg = err instanceof Error ? err.message : String(err);
         if (errMsg.includes("rate limit")) {
           break;
         }
+        // 指数退避：250ms -> 500ms -> 750ms
         const delay = 250 + attempt * 250;
         await new Promise((r) => setTimeout(r, delay));
       }
@@ -381,6 +555,7 @@ async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
     throw new Error(message);
   };
 
+  // 使用 finally 确保连接完成后清理 connecting 缓存
   const pending = connectWithRetry().finally(() => {
     connectingByCdpUrl.delete(normalized);
   });
@@ -389,12 +564,20 @@ async function connectBrowser(cdpUrl: string): Promise<ConnectedBrowser> {
   return await pending;
 }
 
+/**
+ * 获取浏览器所有页面
+ * 从所有浏览器上下文中收集页面
+ */
 async function getAllPages(browser: Browser): Promise<Page[]> {
   const contexts = browser.contexts();
   const pages = contexts.flatMap((c) => c.pages());
   return pages;
 }
 
+/**
+ * 获取页面的 CDP targetId
+ * 通过创建新的 CDP session 发送 Target.getTargetInfo 命令
+ */
 async function pageTargetId(page: Page): Promise<string | null> {
   const session = await page.context().newCDPSession(page);
   try {
@@ -406,6 +589,10 @@ async function pageTargetId(page: Page): Promise<string | null> {
   }
 }
 
+/**
+ * 通过目标列表匹配页面
+ * 处理多个页面 URL 相同的情况
+ */
 function matchPageByTargetList(
   pages: Page[],
   targets: Array<{ id: string; url: string; title?: string }>,
@@ -416,10 +603,12 @@ function matchPageByTargetList(
     return null;
   }
 
+  // 精确 URL 匹配
   const urlMatch = pages.filter((page) => page.url() === target.url);
   if (urlMatch.length === 1) {
     return urlMatch[0] ?? null;
   }
+  // 多个页面相同 URL：使用索引匹配
   if (urlMatch.length > 1) {
     const sameUrlTargets = targets.filter((entry) => entry.url === target.url);
     if (sameUrlTargets.length === urlMatch.length) {
@@ -432,6 +621,10 @@ function matchPageByTargetList(
   return null;
 }
 
+/**
+ * 通过 Target.list API 查找页面
+ * 使用 HTTP JSON 端点获取目标列表
+ */
 async function findPageByTargetIdViaTargetList(
   pages: Page[],
   targetId: string,
@@ -448,15 +641,26 @@ async function findPageByTargetIdViaTargetList(
   return matchPageByTargetList(pages, targets, targetId);
 }
 
+/**
+ * 通过 targetId 查找页面
+ *
+ * 查找策略（按优先级）：
+ * 1. Extension Relay 模式：通过 HTTP /json/list API 查找
+ * 2. CDP 直接查询：对每个页面发送 Target.getTargetInfo
+ * 3. HTTP /json/list 回退
+ * 4. 单页面降级：如果只有一个页面则直接返回
+ */
 async function findPageByTargetId(
   browser: Browser,
   targetId: string,
   cdpUrl?: string,
 ): Promise<Page | null> {
   const pages = await getAllPages(browser);
+  // 检查是否为 Extension Relay 端点
   const isExtensionRelay = cdpUrl
     ? await isExtensionRelayCdpEndpoint(cdpUrl).catch(() => false)
     : false;
+  // Extension Relay 模式：优先使用 HTTP API
   if (cdpUrl && isExtensionRelay) {
     try {
       const matched = await findPageByTargetIdViaTargetList(pages, targetId, cdpUrl);
@@ -464,12 +668,13 @@ async function findPageByTargetId(
         return matched;
       }
     } catch {
-      // Ignore fetch errors and fall through to best-effort single-page fallback.
+      // 忽略 fetch 错误，降级到单页面回退
     }
     return pages.length === 1 ? (pages[0] ?? null) : null;
   }
 
   let resolvedViaCdp = false;
+  // 遍历所有页面，尝试通过 CDP 获取 targetId
   for (const page of pages) {
     let tid: string | null = null;
     try {
@@ -482,19 +687,24 @@ async function findPageByTargetId(
       return page;
     }
   }
+  // CDP 查询失败，尝试 HTTP API 作为回退
   if (cdpUrl) {
     try {
       return await findPageByTargetIdViaTargetList(pages, targetId, cdpUrl);
     } catch {
-      // Ignore fetch errors and fall through to return null.
+      // 忽略错误
     }
   }
+  // 如果从未通过 CDP 解析成功，且只有一个页面，返回该页面
   if (!resolvedViaCdp && pages.length === 1) {
     return pages[0] ?? null;
   }
   return null;
 }
 
+/**
+ * 通过 targetId 解析页面，不存在则抛出异常
+ */
 async function resolvePageByTargetIdOrThrow(opts: {
   cdpUrl: string;
   targetId: string;
@@ -507,6 +717,11 @@ async function resolvePageByTargetIdOrThrow(opts: {
   return page;
 }
 
+/**
+ * 获取目标页面
+ * 如果未指定 targetId，返回第一个页面
+ * 找不到页面时，Extension Relay 单页面场景会返回唯一页面作为降级
+ */
 export async function getPageForTargetId(opts: {
   cdpUrl: string;
   targetId?: string;
@@ -522,9 +737,9 @@ export async function getPageForTargetId(opts: {
   }
   const found = await findPageByTargetId(browser, opts.targetId, opts.cdpUrl);
   if (!found) {
-    // Extension relays can block CDP attachment APIs (e.g. Target.attachToBrowserTarget),
-    // which prevents us from resolving a page's targetId via newCDPSession(). If Playwright
-    // only exposes a single Page, use it as a best-effort fallback.
+    // Extension relays 会阻止 CDP attachment APIs（如 Target.attachToBrowserTarget），
+    // 这导致无法通过 newCDPSession() 解析页面 targetId。
+    // 如果 Playwright 只暴露了一个 Page，作为最佳 effort 回退使用它。
     if (pages.length === 1) {
       return first;
     }
@@ -533,21 +748,38 @@ export async function getPageForTargetId(opts: {
   return found;
 }
 
+/**
+ * 根据 ref 字符串获取 Playwright 定位器
+ *
+ * ref 格式支持：
+ * - `@e1` - role ref 格式（去掉 @ 前缀）
+ * - `ref=e1` - role ref 格式（去掉 ref= 前缀）
+ * - `e1` - role ref 格式
+ * - `aria-ref=xxx` - aria-ref 格式
+ *
+ * role ref 解析：
+ * - mode "role": 通过 getByRole 解析
+ * - mode "aria": 通过 aria-ref 属性解析
+ */
 export function refLocator(page: Page, ref: string) {
+  // 标准化 ref 格式
   const normalized = ref.startsWith("@")
     ? ref.slice(1)
     : ref.startsWith("ref=")
       ? ref.slice(4)
       : ref;
 
+  // e数字格式 → role ref
   if (/^e\d+$/.test(normalized)) {
     const state = pageStates.get(page);
+    // aria 模式：使用 aria-ref 属性
     if (state?.roleRefsMode === "aria") {
       const scope = state.roleRefsFrameSelector
         ? page.frameLocator(state.roleRefsFrameSelector)
         : page;
       return scope.locator(`aria-ref=${normalized}`);
     }
+    // role 模式：使用 getByRole
     const info = state?.roleRefs?.[normalized];
     if (!info) {
       throw new Error(
@@ -569,12 +801,19 @@ export function refLocator(page: Page, ref: string) {
     return info.nth !== undefined ? locator.nth(info.nth) : locator;
   }
 
+  // 默认：使用 aria-ref 属性定位
   return page.locator(`aria-ref=${normalized}`);
 }
 
+/**
+ * 关闭 Playwright 浏览器连接
+ *
+ * @param opts.cdpUrl - 如果指定，只关闭该 URL 的连接；否则关闭所有缓存连接
+ */
 export async function closePlaywrightBrowserConnection(opts?: { cdpUrl?: string }): Promise<void> {
   const normalized = opts?.cdpUrl ? normalizeCdpUrl(opts.cdpUrl) : null;
 
+  // 关闭指定 URL 的连接
   if (normalized) {
     const cur = cachedByCdpUrl.get(normalized);
     cachedByCdpUrl.delete(normalized);
@@ -582,6 +821,7 @@ export async function closePlaywrightBrowserConnection(opts?: { cdpUrl?: string 
     if (!cur) {
       return;
     }
+    // 移除断开监听器，防止重复回调
     if (cur.onDisconnected && typeof cur.browser.off === "function") {
       cur.browser.off("disconnected", cur.onDisconnected);
     }
@@ -589,6 +829,7 @@ export async function closePlaywrightBrowserConnection(opts?: { cdpUrl?: string 
     return;
   }
 
+  // 关闭所有缓存的连接
   const connections = Array.from(cachedByCdpUrl.values());
   cachedByCdpUrl.clear();
   connectingByCdpUrl.clear();
@@ -600,6 +841,10 @@ export async function closePlaywrightBrowserConnection(opts?: { cdpUrl?: string 
   }
 }
 
+/**
+ * 检查 CDP Socket 是否需要 Target.attachToTarget
+ * 某些路径（如 /cdp, /devtools/browser/）需要先附加到目标
+ */
 function cdpSocketNeedsAttach(wsUrl: string): boolean {
   try {
     const pathname = new URL(wsUrl).pathname;
@@ -611,6 +856,18 @@ function cdpSocketNeedsAttach(wsUrl: string): boolean {
   }
 }
 
+/**
+ * 尝试通过 CDP 终止卡住的 JavaScript 执行
+ *
+ * 用途：解除页面卡死状态（如无限循环的 evaluate）
+ * 而不关闭整个浏览器连接
+ *
+ * 流程：
+ * 1. 获取目标的 WebSocket URL
+ * 2. 必要时先 attach 到目标
+ * 3. 发送 Runtime.terminateExecution 命令
+ * 4. 分离 CDP session
+ */
 async function tryTerminateExecutionViaCdp(opts: {
   cdpUrl: string;
   targetId: string;
@@ -618,6 +875,7 @@ async function tryTerminateExecutionViaCdp(opts: {
   const cdpHttpBase = normalizeCdpHttpBaseForJsonEndpoints(opts.cdpUrl);
   const listUrl = appendCdpPath(cdpHttpBase, "/json/list");
 
+  // 获取目标列表
   const pages = await fetchJson<
     Array<{
       id?: string;
@@ -628,6 +886,7 @@ async function tryTerminateExecutionViaCdp(opts: {
     return;
   }
 
+  // 查找目标
   const target = pages.find((p) => String(p.id ?? "").trim() === opts.targetId);
   const wsUrlRaw = String(target?.webSocketDebuggerUrl ?? "").trim();
   if (!wsUrlRaw) {
@@ -636,6 +895,7 @@ async function tryTerminateExecutionViaCdp(opts: {
   const wsUrl = normalizeCdpWsUrl(wsUrlRaw, cdpHttpBase);
   const needsAttach = cdpSocketNeedsAttach(wsUrl);
 
+  // 超时包装器
   const runWithTimeout = async <T>(work: Promise<T>, ms: number): Promise<T> => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeoutPromise = new Promise<never>((_, reject) => {
@@ -650,11 +910,13 @@ async function tryTerminateExecutionViaCdp(opts: {
     }
   };
 
+  // 执行终止
   await withCdpSocket(
     wsUrl,
     async (send) => {
       let sessionId: string | undefined;
       try {
+        // 必要时先附加到目标
         if (needsAttach) {
           const attached = (await runWithTimeout(
             send("Target.attachToTarget", { targetId: opts.targetId, flatten: true }),
@@ -664,13 +926,14 @@ async function tryTerminateExecutionViaCdp(opts: {
             sessionId = attached.sessionId;
           }
         }
+        // 发送终止执行命令
         await runWithTimeout(send("Runtime.terminateExecution", undefined, sessionId), 1500);
         if (sessionId) {
-          // Best-effort cleanup; not required for termination to take effect.
+          // 最佳 effort 清理
           void send("Target.detachFromTarget", { sessionId }).catch(() => {});
         }
       } catch {
-        // Best-effort; ignore
+        // 最佳 effort；忽略错误
       }
     },
     { handshakeTimeoutMs: 2000 },
@@ -678,24 +941,25 @@ async function tryTerminateExecutionViaCdp(opts: {
 }
 
 /**
- * Best-effort cancellation for stuck page operations.
+ * 强制断开 Playwright 到目标页面的连接
  *
- * Playwright serializes CDP commands per page; a long-running or stuck operation (notably evaluate)
- * can block all subsequent commands. We cannot safely "cancel" an individual command, and we do
- * not want to close the actual Chromium tab. Instead, we disconnect Playwright's CDP connection
- * so in-flight commands fail fast and the next request reconnects transparently.
+ * 背景：Playwright 按页面序列化 CDP 命令。
+ * 如果某个操作卡住（如 evaluate），会阻塞该页面的所有后续命令。
+ * 我们不能安全地取消单个命令，也不希望关闭实际的 Chromium 标签页。
  *
- * IMPORTANT: We CANNOT call Connection.close() because Playwright shares a single Connection
- * across all objects (BrowserType, Browser, etc.). Closing it corrupts the entire Playwright
- * instance, preventing reconnection.
+ * 解决方案：断开 Playwright 的 CDP 连接，使进行中的命令快速失败，
+ * 下一个请求会透明地重新连接。
  *
- * Instead we:
- * 1. Null out `cached` so the next call triggers a fresh connectOverCDP
- * 2. Fire-and-forget browser.close() — it may hang but won't block us
- * 3. The next connectBrowser() creates a completely new CDP WebSocket connection
+ * 重要：不能调用 Connection.close()，因为 Playwright 在所有对象间共享单个 Connection。
+ * 关闭它会破坏整个 Playwright 实例，导致无法重新连接。
  *
- * The old browser.close() eventually resolves when the in-browser evaluate timeout fires,
- * or the old connection gets GC'd. Either way, it doesn't affect the fresh connection.
+ * 具体步骤：
+ * 1. 从缓存中删除连接，使下次调用触发新的 connectOverCDP
+ * 2. fire-and-forget browser.close()（可能卡住但不会阻塞我们）
+ * 3. 下次 connectBrowser() 创建全新的 CDP WebSocket 连接
+ *
+ * 旧的 browser.close() 最终会在浏览器内 evaluate 超时或旧连接被 GC 时解决，
+ * 不会影响新连接。
  */
 export async function forceDisconnectPlaywrightForTarget(opts: {
   cdpUrl: string;
@@ -708,29 +972,26 @@ export async function forceDisconnectPlaywrightForTarget(opts: {
     return;
   }
   cachedByCdpUrl.delete(normalized);
-  // Also clear the per-url in-flight connect so the next call does a fresh connectOverCDP
-  // rather than awaiting a stale promise.
+  // 清除正在连接中的 Promise，使下次调用执行全新的 connectOverCDP
   connectingByCdpUrl.delete(normalized);
-  // Remove the "disconnected" listener to prevent the old browser's teardown
-  // from racing with a fresh connection and nulling the new cached entry.
+  // 移除"断开连接"监听器，防止旧的浏览器清理与新连接竞争
   if (cur.onDisconnected && typeof cur.browser.off === "function") {
     cur.browser.off("disconnected", cur.onDisconnected);
   }
 
-  // Best-effort: kill any stuck JS to unblock the target's execution context before we
-  // disconnect Playwright's CDP connection.
+  // 最佳 effort：在断开 Playwright CDP 连接之前，先终止卡住的 JS 来解除阻塞
   const targetId = opts.targetId?.trim() || "";
   if (targetId) {
     await tryTerminateExecutionViaCdp({ cdpUrl: normalized, targetId }).catch(() => {});
   }
 
-  // Fire-and-forget: don't await because browser.close() may hang on the stuck CDP pipe.
+  // Fire-and-forget：不 await，因为 browser.close() 可能在卡住的 CDP 管道上挂起
   cur.browser.close().catch(() => {});
 }
 
 /**
- * List all pages/tabs from the persistent Playwright connection.
- * Used for remote profiles where HTTP-based /json/list is ephemeral.
+ * 通过 Playwright 连接列出所有页面/标签页
+ * 用于远程 profile，因为 HTTP-based /json/list 是短暂的
  */
 export async function listPagesViaPlaywright(opts: { cdpUrl: string }): Promise<
   Array<{
@@ -764,9 +1025,16 @@ export async function listPagesViaPlaywright(opts: { cdpUrl: string }): Promise<
 }
 
 /**
- * Create a new page/tab using the persistent Playwright connection.
- * Used for remote profiles where HTTP-based /json/new is ephemeral.
- * Returns the new page's targetId and metadata.
+ * 使用 Playwright 连接创建新页面/标签页
+ * 用于远程 profile，因为 HTTP-based /json/new 是短暂的
+ * 返回新页面的 targetId 和元数据
+ *
+ * 流程：
+ * 1. 连接浏览器
+ * 2. 获取或创建浏览器上下文
+ * 3. 创建新页面
+ * 4. 可选：导航到指定 URL（带 SSRF 检查）
+ * 5. 返回页面元数据
  */
 export async function createPageViaPlaywright(opts: {
   cdpUrl: string;
@@ -785,29 +1053,33 @@ export async function createPageViaPlaywright(opts: {
   const page = await context.newPage();
   ensurePageState(page);
 
-  // Navigate to the URL
+  // 导航到 URL
   const targetUrl = opts.url.trim() || "about:blank";
   if (targetUrl !== "about:blank") {
     const navigationPolicy = withBrowserNavigationPolicy(opts.ssrfPolicy);
+    // SSRF 检查：导航前验证 URL
     await assertBrowserNavigationAllowed({
       url: targetUrl,
       ...navigationPolicy,
     });
+    // 执行导航
     const response = await page.goto(targetUrl, { timeout: 30_000 }).catch(() => {
-      // Navigation might fail for some URLs, but page is still created
+      // 某些 URL 导航可能失败，但页面仍然被创建
       return null;
     });
+    // 验证重定向链
     await assertBrowserNavigationRedirectChainAllowed({
       request: response?.request(),
       ...navigationPolicy,
     });
+    // 验证最终结果
     await assertBrowserNavigationResultAllowed({
       url: page.url(),
       ...navigationPolicy,
     });
   }
 
-  // Get the targetId for this page
+  // 获取页面的 targetId
   const tid = await pageTargetId(page).catch(() => null);
   if (!tid) {
     throw new Error("Failed to get targetId for new page");
@@ -822,8 +1094,8 @@ export async function createPageViaPlaywright(opts: {
 }
 
 /**
- * Close a page/tab by targetId using the persistent Playwright connection.
- * Used for remote profiles where HTTP-based /json/close is ephemeral.
+ * 通过 targetId 关闭页面/标签页
+ * 用于远程 profile，因为 HTTP-based /json/close 是短暂的
  */
 export async function closePageByTargetIdViaPlaywright(opts: {
   cdpUrl: string;
@@ -834,8 +1106,12 @@ export async function closePageByTargetIdViaPlaywright(opts: {
 }
 
 /**
- * Focus a page/tab by targetId using the persistent Playwright connection.
- * Used for remote profiles where HTTP-based /json/activate can be ephemeral.
+ * 通过 targetId 聚焦页面/标签页
+ * 用于远程 profile，因为 HTTP-based /json/activate 可能是短暂的
+ *
+ * 聚焦策略：
+ * 1. 首先尝试 page.bringToFront()
+ * 2. 如果失败，尝试通过 CDP 直接发送 Page.bringToFront 命令
  */
 export async function focusPageByTargetIdViaPlaywright(opts: {
   cdpUrl: string;
@@ -846,6 +1122,7 @@ export async function focusPageByTargetIdViaPlaywright(opts: {
     await page.bringToFront();
   } catch (err) {
     try {
+      // CDP 回退：直接通过 CDP 命令聚焦
       await withPageScopedCdpClient({
         cdpUrl: opts.cdpUrl,
         page,
