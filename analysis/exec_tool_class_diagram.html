@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>ExecTool 类图</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  body { margin: 0; padding: 20px; background: #fff; font-family: system-ui, sans-serif; }
+  .mermaid { max-width: 100%; }
+</style>
+</head>
+<body>
+<div class="mermaid">
+classDiagram
+ direction TB
+
+ class AgentTool {
+ &lt;&lt;interface&gt;&gt;
+ +name: string
+ +label: string
+ +description: string
+ +parameters: TSchema
+ +execute() AgentToolResult
+ }
+
+ class ExecToolFactory {
+ +createExecTool(defaults) AgentTool
+ }
+
+ AgentTool &lt;|.. ExecToolFactory : 创建
+
+ class ExecToolDefaults {
+ +host: ExecHost
+ +security: ExecSecurity
+ +ask: ExecAsk
+ +node: string
+ +pathPrepend: string[]
+ +safeBins: string[]
+ +safeBinProfiles: Record
+ +elevated: ExecElevatedDefaults
+ +sandbox: BashSandboxConfig
+ +cwd: string
+ +sessionKey: string
+ +agentId: string
+ +timeoutSec: number
+ +backgroundMs: number
+ +allowBackground: boolean
+ +notifyOnExit: boolean
+ }
+
+ class ExecToolDetails {
+ +status: string
+ +sessionId: string
+ +pid: number
+ +exitCode: number
+ +durationMs: number
+ +aggregated: string
+ +approvalId: string
+ +host: string
+ +cwd: string
+ }
+
+ class ExecElevatedDefaults {
+ +enabled: boolean
+ +allowed: boolean
+ +defaultLevel: string
+ }
+
+ class ExecSchema {
+ +command: string
+ +workdir: string
+ +env: Record
+ +yieldMs: number
+ +background: boolean
+ +timeout: number
+ +pty: boolean
+ +elevated: boolean
+ +host: string
+ +security: string
+ +ask: string
+ +node: string
+ }
+
+ ExecToolFactory --> ExecToolDefaults : 使用
+ ExecToolFactory --> ExecToolDetails : 返回
+ ExecToolFactory --> ExecSchema : 参数schema
+ ExecToolDefaults --> ExecElevatedDefaults : 包含
+
+ class ProcessSupervisor {
+ &lt;&lt;interface&gt;&gt;
+ +spawn(input) ManagedRun
+ +cancel(runId, reason) void
+ +cancelScope(scopeKey, reason) void
+ +getRecord(runId) RunRecord
+ +reconcileOrphans() void
+ }
+
+ class ManagedRun {
+ +runId: string
+ +pid: number
+ +startedAtMs: number
+ +stdin: ManagedRunStdin
+ +wait() RunExit
+ +cancel(reason) void
+ }
+
+ class SpawnInput {
+ &lt;&lt;union&gt;&gt;
+ +runId: string
+ +sessionId: string
+ +backendId: string
+ +scopeKey: string
+ +cwd: string
+ +env: ProcessEnv
+ +timeoutMs: number
+ +captureOutput: boolean
+ +onStdout(chunk) void
+ +onStderr(chunk) void
+ +mode: string
+ }
+
+ class SpawnChildInput {
+ +mode: child
+ +argv: string[]
+ +stdinMode: string
+ +windowsVerbatimArguments: boolean
+ }
+
+ class SpawnPtyInput {
+ +mode: pty
+ +ptyCommand: string
+ }
+
+ class RunExit {
+ +reason: TerminationReason
+ +exitCode: number
+ +exitSignal: Signal
+ +durationMs: number
+ +stdout: string
+ +stderr: string
+ +timedOut: boolean
+ }
+
+ class RunRecord {
+ +runId: string
+ +sessionId: string
+ +state: string
+ +startedAtMs: number
+ +exitCode: number
+ }
+
+ class RunRegistry {
+ +add(record) void
+ +updateState(runId, state, fields) void
+ +touchOutput(runId) void
+ +finalize(runId, fields) void
+ +get(runId) RunRecord
+ }
+
+ ProcessSupervisor --> ManagedRun : spawn返回
+ ProcessSupervisor --> SpawnInput : 输入
+ SpawnInput &lt;|-- SpawnChildInput
+ SpawnInput &lt;|-- SpawnPtyInput
+ ProcessSupervisor --> RunRegistry : 使用
+ RunRegistry --> RunRecord : 管理
+
+ class ProcessSession {
+ +id: string
+ +command: string
+ +scopeKey: string
+ +sessionKey: string
+ +pid: number
+ +startedAt: number
+ +cwd: string
+ +exited: boolean
+ +backgrounded: boolean
+ +aggregated: string
+ +tail: string
+ +truncated: boolean
+ +child: ChildProcess
+ +stdin: SessionStdin
+ +notifyOnExit: boolean
+ }
+
+ class ProcessRegistry {
+ +addSession(session) void
+ +getSession(id) ProcessSession
+ +getFinishedSession(id) FinishedSession
+ +deleteSession(id) void
+ +appendOutput(session, stream, chunk) void
+ +drainSession(session) string
+ +markExited(session, code, signal, status) void
+ +markBackgrounded(session) void
+ +tail(aggregated, len) string
+ }
+
+ ProcessRegistry --> ProcessSession : 管理
+
+ class ExecApprovalsFile {
+ +defaults: object
+ +agents: map
+ }
+
+ class ExecApprovalsEngine {
+ +evaluateShellAllowlist(params) AllowlistEval
+ +buildEnforcedShellCommand(params) EnforcedCmdResult
+ +requiresExecApproval(params) boolean
+ +normalizeExecHost(value) ExecHost
+ +normalizeExecSecurity(value) ExecSecurity
+ +normalizeExecAsk(value) ExecAsk
+ +minSecurity(a, b) ExecSecurity
+ +maxAsk(a, b) ExecAsk
+ +loadExecApprovals() ExecApprovalsFile
+ +resolveExecApprovals(agentId, overrides) void
+ }
+
+ class GatewayHostExecutor {
+ +processGatewayAllowlist(params) ProcessGatewayAllowlistResult
+ }
+
+ class GatewayAllowlistParams {
+ +command: string
+ +workdir: string
+ +env: Record
+ +pty: boolean
+ +security: ExecSecurity
+ +ask: ExecAsk
+ +safeBins: Set
+ +safeBinProfiles: Record
+ +agentId: string
+ +sessionKey: string
+ }
+
+ GatewayHostExecutor --> ExecApprovalsEngine : 使用
+ GatewayHostExecutor --> GatewayAllowlistParams : 输入
+
+ class NodeHostExecutor {
+ +executeNodeHostCommand(params) AgentToolResult
+ }
+
+ class NodeHostParams {
+ +command: string
+ +workdir: string
+ +env: Record
+ +requestedNode: string
+ +boundNode: string
+ +security: ExecSecurity
+ +ask: ExecAsk
+ }
+
+ NodeHostExecutor --> ExecApprovalsEngine : 使用
+ NodeHostExecutor --> NodeHostParams : 输入
+
+ class ShellUtils {
+ +getShellConfig() ShellConfig
+ +resolvePowerShellPath() string
+ +sanitizeBinaryOutput(text) string
+ +killProcessTree(pid) void
+ }
+
+ class SandboxUtils {
+ +buildSandboxEnv(params) Record
+ +buildDockerExecArgs(params) string[]
+ +resolveSandboxWorkdir(params) WorkdirResult
+ +resolveWorkdir(workdir, warnings) string
+ }
+
+ class ExecPreflight {
+ +validateScriptFileForShellBleed(params) void
+ +extractScriptTargetFromCommand(cmd) ScriptTarget
+ }
+
+ ExecToolFactory --> ProcessSupervisor : 通过getProcessSupervisor
+ ExecToolFactory --> ProcessRegistry : 管理会话
+ ExecToolFactory --> GatewayHostExecutor : host=gateway
+ ExecToolFactory --> NodeHostExecutor : host=node
+ ExecToolFactory --> ShellUtils : 获取shell配置
+ ExecToolFactory --> SandboxUtils : 沙箱执行
+ ExecToolFactory --> ExecPreflight : 执行前预检
+ ExecToolFactory --> ExecApprovalsEngine : 安全策略
+ ExecToolFactory ..> ManagedRun : 获取run句柄
+
+ GatewayHostExecutor --> ExecToolFactory : 审批通过后调用
+ NodeHostExecutor --> ExecApprovalsEngine : 节点安全评估
+</div>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: 'default' });
+</script>
+</body>
+</html>

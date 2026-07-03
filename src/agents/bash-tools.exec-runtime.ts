@@ -1,3 +1,26 @@
+/**
+ * Bash exec 运行时
+ *
+ * 本模块是 exec 工具的核心运行时实现，负责将上层 Agent 的 Shell 命令请求
+ * 转换为实际的子进程执行流程。主要职责包括：
+ *
+ * 1. 环境变量安全：清理与验证宿主环境变量，阻止危险变量与 PATH 劫持
+ * 2. 工具参数 Schema：定义并导出 exec 工具的 TypeBox 参数 schema
+ * 3. 通知与审批：构建审批待处理消息、发送系统事件、后台退出通知
+ * 4. 进程编排：通过 ProcessSupervisor 启动子进程（支持 child / PTY / Docker exec
+ *    三种模式），处理 PTY 失败回退、stdout/stderr 流式采集、DSR 光标响应
+ * 5. 结果聚合：将 supervisor 退出结果包装为 ExecProcessOutcome，
+ *    并对 shell 失败码 126/127、超时、信号中止等场景给出明确的失败原因
+ *
+ * 工作流程概述：
+ *   runExecProcess()
+ *     ├─ 创建 ProcessSession 并注册到 bash-process-registry
+ *     ├─ 根据 sandbox / pty / 普通模式构造 spawnSpec
+ *     ├─ 调用 supervisor.spawn() 启动进程（PTY 失败时回退到 child）
+ *     ├─ 流式接收输出 → appendOutput → onUpdate 回调
+ *     └─ 等待退出 → markExited → maybeNotifyOnExit → 返回 ExecProcessOutcome
+ */
+
 import path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import { Type } from "@sinclair/typebox";
@@ -470,6 +493,8 @@ export async function runExecProcess(opts: {
   addSession(session);
 
   // 发出更新回调的辅助函数
+  // 在每次输出追加后被调用，向上层 Agent 推送当前的"运行中"快照
+  // 包含警告文本 + 末尾输出预览以及 sessionId/pid 等运行时元信息
   const emitUpdate = () => {
     if (!opts.onUpdate) {
       return;
@@ -490,6 +515,9 @@ export async function runExecProcess(opts: {
   };
 
   // 处理标准输出
+  // 1. sanitizeBinaryOutput：过滤掉二进制控制字符，避免破坏 UI 渲染
+  // 2. chunkString：将大块输出切片，防止单次写入过大触发性能问题
+  // 3. appendOutput：追加到 ProcessSession 缓冲区（同时处理截断）
   const handleStdout = (data: string) => {
     const str = sanitizeBinaryOutput(data.toString());
     for (const chunk of chunkString(str)) {
@@ -515,6 +543,10 @@ export async function runExecProcess(opts: {
 
   // 根据配置构建 spawn 规格
   // 两种模式：child（子进程）或 pty（伪终端）
+  // 决策优先级：
+  //   1. 有 sandbox 配置 → 包装为 `docker exec ...` 的 child 模式
+  //   2. usePty=true 且非沙箱 → pty 模式（携带 child 回退命令行）
+  //   3. 其他情况 → 普通 child 模式（stdin 关闭，避免悬挂等待输入）
   const spawnSpec:
     | {
         mode: "child";
@@ -575,6 +607,10 @@ export async function runExecProcess(opts: {
   const cursorResponse = buildCursorPositionResponse();
 
   // 处理监督器输出的标准输出
+  // PTY 模式下需要拦截 DSR（Device Status Report，设备状态请求）：
+  //   一些 TUI 程序（如 vim、less）会向 stdout 写入 ESC[6n 询问光标位置，
+  //   如果不回复，程序会卡死等待。这里检测到 DSR 后用预制的"假光标位置"
+  //   回写到 stdin，让程序继续运行；并把 DSR 字节从 stdout 中剥离以免污染输出。
   const onSupervisorStdout = (chunk: string) => {
     if (usingPty) {
       // 剥离 DSR（设备状态请求）并处理光标响应
@@ -591,6 +627,11 @@ export async function runExecProcess(opts: {
   };
 
   // 尝试启动进程
+  // spawnBase 是 supervisor.spawn 的公共参数集合
+  //   - runId：本次执行的唯一 ID（= sessionId）
+  //   - sessionId：用于跨次执行的会话维度（通常为 Agent 会话 key）
+  //   - backendId：用于 supervisor 内部按后端分组统计（exec-sandbox / exec-host）
+  //   - captureOutput=false：不让 supervisor 自行缓存输出，由本模块通过回调采集
   try {
     const spawnBase = {
       runId: sessionId,
@@ -620,6 +661,7 @@ export async function runExecProcess(opts: {
           });
   } catch (err) {
     // PTY 模式失败时，尝试回退到普通子进程模式
+    // 这通常发生在缺少 node-pty 原生模块或操作系统不支持 PTY 的情况下
     if (spawnSpec.mode === "pty") {
       const warning = `Warning: PTY spawn failed (${String(err)}); retrying without PTY for \`${opts.command}\`.`;
       logWarn(
@@ -659,6 +701,9 @@ export async function runExecProcess(opts: {
   session.pid = managedRun.pid;
 
   // 等待进程完成的 Promise
+  // 该 promise 在进程退出后产生一个 ExecProcessOutcome：
+  //   - 正常 exit 且非 shell 失败码 → status=completed
+  //   - 否则 → status=failed，并根据 reason 区分超时/信号/shell 故障
   const promise = managedRun
     .wait()
     .then((exit): ExecProcessOutcome => {
@@ -694,6 +739,8 @@ export async function runExecProcess(opts: {
         };
       }
       // 失败时构建原因描述
+      // 优先级：shell 失败码 > overall-timeout > no-output-timeout > 信号中止 > 未知
+      // 超时场景会附带提示用户增大 timeout 参数的建议
       const reason = isShellFailure
         ? exitCode === 127
           ? "Command not found"
@@ -735,12 +782,14 @@ export async function runExecProcess(opts: {
     });
 
   // 返回进程句柄
+  // 调用方可通过 handle.promise await 最终结果，或通过 handle.kill() 主动取消
   return {
     session,
     startedAt,
     pid: session.pid ?? undefined,
     promise,
     kill: () => {
+      // 通过 supervisor 取消运行，cancel 原因会传递给上层用于日志/事件
       managedRun?.cancel("manual-cancel");
     },
   };

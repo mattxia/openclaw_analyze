@@ -426,7 +426,7 @@ export function createExecTool(
 
       // ==================== 执行主机（host）配置 ====================
       // host 指定命令在哪里执行：
-      // - sandbox: 在 Docker 沙箱容器中执行（默认）
+      // - sandbox:  在 Docker 沙箱容器中执行（默认）
       // - gateway: 在网关主机上执行
       // - node: 在远程配对节点上执行
       const configuredHost = defaults?.host ?? "sandbox"; // 配置的默认 host
